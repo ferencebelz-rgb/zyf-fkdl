@@ -1,0 +1,13 @@
+Debug/
+.ads/
+.settings/
+*.src
+*.o
+*.d
+*.map
+*.elf
+*.hex
+*.s19
+*.launch
+删除临时文件.bat
+AURIX修改工程名称.bat
