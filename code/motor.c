@@ -110,7 +110,6 @@ void motor_init(void)
     Control_Init();
 
 #if (MOTOR_TEST_MODE == 0)
-    pit_ms_init(CCU60_CH1, 1);
     pit_ms_init(CONTROL_TIMER, CONTROL_PERIOD_MS);
 #endif
 }

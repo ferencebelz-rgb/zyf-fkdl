@@ -30,12 +30,6 @@
 
 #define SPEED_KP_DEFAULT    2.0f
 #define SPEED_KI_DEFAULT    0.6f
-#define SPEED_KP_MIN        1.0f
-#define SPEED_KP_MAX        5.0f
-#define SPEED_KP_STEP       0.5f
-#define SPEED_KI_MIN        0.0f
-#define SPEED_KI_MAX        5.0f
-#define SPEED_KI_STEP       0.2f
 
 #define MAX_PWM             6666
 #define PWM_STEP_LIMIT      200

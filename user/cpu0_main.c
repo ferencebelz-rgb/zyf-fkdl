@@ -2,37 +2,47 @@
 #pragma section all "cpu0_dsram"
 
 #include "camera.h"
+#include "fan.h"
 #include "imu.h"
 #include "motor.h"
 #include "zf_device_ips200.h"
-
-#define USE_IMU_MODULE 0
+#include "zf_device_key.h"
 
 int core0_main(void)
 {
-    // 系统基础初始化
     clock_init();
     debug_init();
     disable_Watchdog();
     system_delay_init();
 
-    // 必须开启全局中断，DMA抓图和 10ms 控制中断都依赖于此
     interrupt_global_enable(0);
 
-    // 屏幕初始化
     ips200_init(IPS200_TYPE_SPI);
     ips200_clear();
 
-    // ============================================
-    // 核心模块初始化
     cam_init();
-#if USE_IMU_MODULE
+    fan_init();
     imu_init();
-#endif
-    motor_init();  // 执行完毕后，底层 10ms 中断闭环开始独立运行！
-    // ============================================
+    pit_ms_init(CCU60_CH1, 1);  // 1 ms IMU trigger
+    key_init(10);
 
     cpu_wait_event_ready();
+
+    // Wait for KEY1 before starting motors (camera runs in background)
+    while(TRUE)
+    {
+        key_scanner();
+        if(key_get_state(KEY_1) == KEY_SHORT_PRESS)
+        {
+            key_clear_state(KEY_1);
+            break;
+        }
+        image_process_task();
+        image_display_task();
+        system_delay_ms(20);
+    }
+
+    motor_init();
 
 #if (MOTOR_TEST_MODE == 1)
     motor_encoder_test_task();
@@ -40,11 +50,10 @@ int core0_main(void)
     motor_openloop_pwm_test_task();
 #endif
 
-    // 主循环：全速狂奔，纯算图像！再也不用操心电机的延时阻塞。
     while(TRUE)
     {
-        image_process_task();   // 识别赛道、算偏差
-        image_display_task();   // 显示屏幕
+        image_process_task();
+        image_display_task();
         motor_display_status_task();
     }
 }

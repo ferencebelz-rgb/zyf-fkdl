@@ -1,30 +1,27 @@
 #include "camera.h"
+#include "imu.h"
 #include "zf_device_ips200.h"
 #include "zf_device_mt9v03x_double.h"
 #include "zf_driver_dma.h"
 #include <string.h>
 
-// ========================= �궨���뿪�� =========================
-#define ENABLE_DISPLAY 1             // �Ƿ�����Ļ��ʾ (������Ϊ0)
-#define LOST_LINE_REPLACE_VAL (MT9V03X_1_W / 2)    // ����ʱ��Ĭ������е�ֵ(����Ļ����)
-#define TRACK_LINE_IS_BLACK 0        // 1=���߰׵�, 0=���ߺڵ�
-#define ENABLE_TURN_DEBUG 1          // 1=����ʾ�ϻ���ֱ��ת���⼣
+#define ENABLE_DISPLAY 1             
+#define LOST_LINE_REPLACE_VAL (MT9V03X_1_W / 2)    
+#define TRACK_LINE_IS_BLACK 0        
+#define ENABLE_TURN_DEBUG 1          
 
-// Adaptive dark-offset range — scaled by Otsu threshold to compensate exposure
 #define THRESHOLD_DARK_MIN         30
 #define THRESHOLD_DARK_MAX         30
 #define THRESHOLD_CLAMP_LO         30
 #define THRESHOLD_CLAMP_HI        220
 
-// ����ӿڱ���
 // line_mid[] and track_offset are consumed by motor.c in the 10ms control ISR.
 // If compiler optimization is enabled later, consider making shared variables volatile.
-int16 line_mid[MT9V03X_1_H];         // ��������
-int16 track_offset = 0;              // ����ƫ����
+int16 line_mid[MT9V03X_1_H];         // centreline buffer
+int16 track_offset = 0;              // track offset (px)
 uint8 junction_type_from_camera = 0; // 0=normal, 1=T/corner, 2=cross/L, 3=sharp turn (dir from sign of track_offset)
 static uint8 line_lost_count = 0;
 
-// ========================= ԭͼ��˫���� =========================
 // raw_snapshot stores one stable grayscale frame copied from the camera DMA buffer.
 // binary_buf_0/1 and line_mid_buf_0/1 are swapped so display does not read data
 // while the next frame is being processed.
@@ -51,14 +48,12 @@ static int  turn_dbg_end_x   = 0;
 static int  turn_dbg_end_y   = 0;
 static int  turn_dbg_is_left = 0;
 
-// ========================= ����ͷ��ʼ�� =========================
 void cam_init(void)
 {
     mt9v03x_set_confing_buffer_1[MT9V03X_DOUBLE_EXP_TIME][1] = 400;
     mt9v03x_double_init(mt9v03x_1);
 }
 
-// ========================= ���彻�� =========================
 static void image_swap_buffer(void)
 {
     // After processing one frame, swap process/display buffers in O(1) time.
@@ -71,20 +66,16 @@ static void image_swap_buffer(void)
     display_line_mid = temp_line_mid;
 }
 
-// ========================= ץȡһ֡ͼ�� =========================
 static void camera_copy_stable_frame(void)
 {
-    // ���Ż����顿�������֧��˫�����㿽�����������ֱ�Ӹ�ָ�롣
-    // ��������� memcpy�����鲻ҪƵ�� disable dma ����˺�ѣ������� DMA ����жϵ�˲�俽����
+
     memcpy(raw_snapshot[0], mt9v03x_image_1[0], MT9V03X_1_W * MT9V03X_1_H);
 }
 
-// ========================= �߽��٣�ֱ��ת���� =========================
-// Adapted from 草莽 reference: track left/right edges row-by-row from bottom
 // upward. When one edge disappears (hits image boundary) while the other
 // remains visible, a sharp right-angle turn is detected.
 // Mid-line is then drawn as a straight line from the bottom-centre to the
-// row where the edge was lost — matching the Left_curve_line / Right_curve_line
+
 // approach in the reference implementation.
 static void detect_boundary_sharp_turn(void)
 {
@@ -115,7 +106,7 @@ static void detect_boundary_sharp_turn(void)
 
         if (l >= 0 && l <= SHARP_TURN_EDGE_MARGIN)
         {
-            // Left edge is against the image boundary — potentially lost
+
             if (left_lost_row < 0) left_lost_row = i;
         }
         else if (l > SHARP_TURN_EDGE_MARGIN)
@@ -221,7 +212,6 @@ static void detect_boundary_sharp_turn(void)
     turn_dbg_is_left = is_left_turn;
 }
 
-// ========================= �����̬��ֵ (�������ٰ�) =========================
 static uint8 compute_otsu_threshold(void)
 {
     // Otsu selects a threshold from the grayscale histogram. It adapts better
@@ -230,12 +220,10 @@ static uint8 compute_otsu_threshold(void)
     int pixel_count = MT9V03X_1_H * MT9V03X_1_W;
     uint8 *img_ptr = &raw_snapshot[0][0];
 
-    // 1. ͳ�ƻҶ�ֱ��ͼ (ʹ�� 1D ָ���������)
     for(int i = 0; i < pixel_count; i++) {
         histogram[img_ptr[i]]++;
     }
 
-    // 2. �����ܻҶ�ֵ
     int sum = 0;
     for(int i = 0; i < 256; i++) {
         sum += i * histogram[i];
@@ -245,7 +233,6 @@ static uint8 compute_otsu_threshold(void)
     float varMax = 0.0;
     uint8 threshold = 0;
 
-    // 3. Ѱ�������䷽�� (��ѧ��Ч�������������ĳ����͸�������)
     for(int i = 0; i < 256; i++) {
         wB += histogram[i];
         if (wB == 0) continue;
@@ -256,7 +243,6 @@ static uint8 compute_otsu_threshold(void)
         sumB += i * histogram[i];
         int sumF = sum - sumB;
 
-        // ��Ч����ʽ��Var = (sumB^2 / wB) + (sumF^2 / wF)
         float varBetween = (float)sumB * sumB / wB + (float)sumF * sumF / wF;
 
         if (varBetween > varMax) {
@@ -266,8 +252,7 @@ static uint8 compute_otsu_threshold(void)
     }
 
     // Clamp Otsu result, then apply an exposure-adaptive dark offset.
-    // Brighter scene (higher Otsu) → larger offset → stronger darkening.
-    // Darker  scene (lower  Otsu) → smaller offset → preserves weak signal.
+
     if(threshold < THRESHOLD_CLAMP_LO) threshold = THRESHOLD_CLAMP_LO;
     if(threshold > THRESHOLD_CLAMP_HI) threshold = THRESHOLD_CLAMP_HI;
 
@@ -283,7 +268,6 @@ static uint8 compute_otsu_threshold(void)
     return threshold;
 }
 
-// ========================= ͼ�������� =========================
 void image_process_task(void)
 {
     if (mt9v03x_finish_flag_1 == 1)
@@ -292,10 +276,8 @@ void image_process_task(void)
         // Clear it first so the next frame can be detected.
         mt9v03x_finish_flag_1 = 0;
 
-        // 1. ��ȡ�ȶ�ԭͼ
         camera_copy_stable_frame();
 
-        // 2. Otsu动态阈值二值化
         uint8 dynamic_threshold = compute_otsu_threshold();
         uint8 *src = &raw_snapshot[0][0];
         uint8 *dst = &process_image[0][0];
@@ -309,8 +291,7 @@ void image_process_task(void)
 #endif
         }
 
-        // 3. �����ɨ�߷�
-        int lost_line_count = 0; // ��¼���ߵ�����(���ڼ򵥵�·�ڼ��)
+        int lost_line_count = 0; // consecutive lost-line counter
 
         for (int i = MT9V03X_1_H - 1; i >= 0; i--)
         {
@@ -354,7 +335,6 @@ void image_process_task(void)
             while ((left > 0) && (process_image[i][left] != 0)) left--;
             while ((right < MT9V03X_1_W - 1) && (process_image[i][right] != 0)) right++;
 
-            // �������Ż��������߼���߼�
             if (right - left < 3)
             {
                 process_line_mid[i] = center_seed;
@@ -366,12 +346,10 @@ void image_process_task(void)
             }
         }
 
-        // 4. 边界追踪直角弯检测（参考草莽参考代码）
         detect_boundary_sharp_turn();
 
         line_lost_count = (lost_line_count > 255) ? 255 : (uint8)lost_line_count;
 
-        // 5. 计算前瞻偏移量 (加权平均)
         {
             int32 sum = 0;
             int32 weight_sum = 0;
@@ -387,19 +365,17 @@ void image_process_task(void)
             track_offset = (weight_sum > 0) ? (int16)(sum / weight_sum) : 0;
         }
 
-        // 6. 同步中线给外部循环使用
         for (int i = 0; i < MT9V03X_1_H; i++)
         {
             line_mid[i] = process_line_mid[i];
         }
 
-        // 7. 交换显示缓冲
+        // 7. 浜ゆ崲鏄剧ず缂撳啿
         image_swap_buffer();
         image_ready = 1;
     }
 }
 
-// ========================= ͼ����ʾ���� =========================
 void image_display_task(void)
 {
 #if ENABLE_DISPLAY
@@ -408,7 +384,7 @@ void image_display_task(void)
 
     // IPS200 refresh is slow compared with image processing, so only show
     // every third processed frame. Set ENABLE_DISPLAY to 0 for race runs.
-    if (++refresh_cnt < 3) return; // ��֡��ʾ
+    if (++refresh_cnt < 3) return; // skip 2 of 3 frames
     refresh_cnt = 0;
 
     ips200_show_gray_image(0, 0, display_image[0], MT9V03X_1_W, MT9V03X_1_H, MT9V03X_1_W, MT9V03X_1_H, 0);
@@ -420,6 +396,15 @@ void image_display_task(void)
             ips200_draw_point((uint16)display_line_mid[i], (uint16)i, RGB565_RED);
         }
     }
+
+    ips200_set_font(IPS200_6X8_FONT);
+    ips200_set_color(RGB565_RED, RGB565_WHITE);
+    ips200_show_string(0, 122, "GZ");
+    ips200_show_int(18, 122, (int32)(gyro[2] * 57.3f), 4);
+    ips200_show_string(54, 122, "GY");
+    ips200_show_int(72, 122, (int32)(gyro[1] * 57.3f), 4);
+    ips200_show_string(108, 122, "GX");
+    ips200_show_int(126, 122, (int32)(gyro[0] * 57.3f), 4);
 
 #if ENABLE_TURN_DEBUG
     // Sharp-turn detection debug overlay (read-only, does not affect motor)
