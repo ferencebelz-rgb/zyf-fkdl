@@ -8,6 +8,8 @@
 #include "zf_device_ips200.h"
 #include "zf_device_key.h"
 
+static uint8 fan_on = 0;  /* 负压风扇开关状态 */
+
 int core0_main(void)
 {
     clock_init();
@@ -21,22 +23,31 @@ int core0_main(void)
     ips200_clear();
 
     cam_init();
-    fan_init();
+    fan_init();  // 上电默认关闭，KEY4 切换
     imu_init();
     pit_ms_init(CCU60_CH1, 1);  // 1 ms IMU trigger
     key_init(10);
 
     cpu_wait_event_ready();
 
-    // Wait for KEY1 before starting motors (camera runs in background)
+    // 等待 KEY1 启动任务 / KEY4 切换负压风扇
     while(TRUE)
     {
         key_scanner();
+
         if(key_get_state(KEY_1) == KEY_SHORT_PRESS)
         {
             key_clear_state(KEY_1);
-            break;
+            break;  // 启动任务1
         }
+
+        if(key_get_state(KEY_4) == KEY_SHORT_PRESS)
+        {
+            key_clear_state(KEY_4);
+            fan_on = !fan_on;
+            fan_set_duty(fan_on ? 40 : 0);
+        }
+
         image_process_task();
         image_display_task();
         system_delay_ms(20);
@@ -52,6 +63,16 @@ int core0_main(void)
 
     while(TRUE)
     {
+        key_scanner();
+
+        // KEY4 运行中切换负压风扇
+        if(key_get_state(KEY_4) == KEY_SHORT_PRESS)
+        {
+            key_clear_state(KEY_4);
+            fan_on = !fan_on;
+            fan_set_duty(fan_on ? 40 : 0);
+        }
+
         image_process_task();
         image_display_task();
         motor_display_status_task();

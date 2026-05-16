@@ -1,30 +1,47 @@
+/*
+ * camera.c - MT9V03X 双摄像头图像处理与中线提取
+ *
+ * 本模块负责：
+ *   1) 从摄像头 DMA 缓冲区获取一帧原始灰度图
+ *   2) 用 Otsu 大津法自适应二值化
+ *   3) 逐行搜索赛道左右边界，计算中线
+ *   4) 直角弯检测（边界丢失法 + 角点定位）
+ *   5) 加权平均计算赛道偏移量（供 control.c 使用）
+ *   6) 显示摄像头图像 + 中线 + IMU 陀螺仪数据
+ */
+
 #include "camera.h"
 #include "imu.h"
+#include "task1.h"
 #include "zf_device_ips200.h"
 #include "zf_device_mt9v03x_double.h"
 #include "zf_driver_dma.h"
 #include <string.h>
 
-#define ENABLE_DISPLAY 1             
-#define LOST_LINE_REPLACE_VAL (MT9V03X_1_W / 2)    
-#define TRACK_LINE_IS_BLACK 0        
-#define ENABLE_TURN_DEBUG 1          
+/* ======================== 编译开关 ======================== */
 
-#define THRESHOLD_DARK_MIN         30
-#define THRESHOLD_DARK_MAX         30
-#define THRESHOLD_CLAMP_LO         30
-#define THRESHOLD_CLAMP_HI        220
+#define ENABLE_DISPLAY 1             /* 1=开启屏幕显示，比赛时可关闭以提高帧率 */
+#define LOST_LINE_REPLACE_VAL (MT9V03X_1_W / 2)  /* 丢线时填充图像中心 */
+#define TRACK_LINE_IS_BLACK 0        /* 1=白色底板黑色赛道  0=黑色底板白色赛道 */
+#define ENABLE_TURN_DEBUG 1          /* 1=显示直角弯诊断线条（赛后清零 */
 
-// line_mid[] and track_offset are consumed by motor.c in the 10ms control ISR.
-// If compiler optimization is enabled later, consider making shared variables volatile.
-int16 line_mid[MT9V03X_1_H];         // centreline buffer
-int16 track_offset = 0;              // track offset (px)
-uint8 junction_type_from_camera = 0; // 0=normal, 1=T/corner, 2=cross/L, 3=sharp turn (dir from sign of track_offset)
-static uint8 line_lost_count = 0;
+/* ====================== 二值化参数 ====================== */
 
-// raw_snapshot stores one stable grayscale frame copied from the camera DMA buffer.
-// binary_buf_0/1 and line_mid_buf_0/1 are swapped so display does not read data
-// while the next frame is being processed.
+#define THRESHOLD_DARK_MIN         30 /* Otsu 结果的最小偏移补偿 */
+#define THRESHOLD_DARK_MAX         30 /* 最大偏移补偿（与 MIN 相等时固定偏移 */
+#define THRESHOLD_CLAMP_LO         30 /* Otsu 结果下限 */
+#define THRESHOLD_CLAMP_HI        220 /* Otsu 结果上限 */
+
+/* ====================== 对外全局变量 ====================== */
+
+int16 line_mid[MT9V03X_1_H];         /* 各行的中线列坐标，供 control.c 前视用 */
+int16 track_offset = 0;              /* 赛道偏移量（像素），供 control.c 转向用 */
+uint8 junction_type_from_camera = 0; /* 0=直道 1=T/直角 2=十字/L 3=急转弯 */
+static uint8 line_lost_count = 0;    /* 连续丢线行数统计 */
+
+/* =================== 双缓冲缓冲区定义 =================== */
+
+/* raw_snapshot：从 DMA 缓冲区稳定拷贝的一帧原始灰度图 */
 static uint8 raw_snapshot[MT9V03X_1_H][MT9V03X_1_W];
 static uint8 binary_buf_0[MT9V03X_1_H][MT9V03X_1_W];
 static uint8 binary_buf_1[MT9V03X_1_H][MT9V03X_1_W];
@@ -32,6 +49,7 @@ static uint8 binary_buf_1[MT9V03X_1_H][MT9V03X_1_W];
 static int16 line_mid_buf_0[MT9V03X_1_H];
 static int16 line_mid_buf_1[MT9V03X_1_H];
 
+/* 处理缓冲区和显示缓冲区指针，每帧交换一次，避免 DMA 和显示冲突 */
 static uint8 (*process_image)[MT9V03X_1_W] = binary_buf_0;
 static int16 *process_line_mid = line_mid_buf_0;
 
@@ -40,7 +58,7 @@ static int16 *display_line_mid = line_mid_buf_1;
 
 static uint8 image_ready = 0;
 
-// Sharp-turn debug overlay data (write-once from process, read from display)
+/* 直角弯调试叠加数据（process 写入，display 读取 */
 static int  turn_dbg_active  = 0;
 static int  turn_dbg_start_x = 0;
 static int  turn_dbg_start_y = 0;
@@ -48,15 +66,20 @@ static int  turn_dbg_end_x   = 0;
 static int  turn_dbg_end_y   = 0;
 static int  turn_dbg_is_left = 0;
 
+/* ==================== 初始化函数 ==================== */
+
 void cam_init(void)
 {
+    /* 设置曝光时间为 400（默认值，可根据环境调整 */
     mt9v03x_set_confing_buffer_1[MT9V03X_DOUBLE_EXP_TIME][1] = 400;
     mt9v03x_double_init(mt9v03x_1);
 }
 
+/* ================== 缓冲区交换 ================== */
+
 static void image_swap_buffer(void)
 {
-    // After processing one frame, swap process/display buffers in O(1) time.
+    /* O(1) 时间交换 process/display 指针，避免大块内存拷贝 */
     uint8 (*temp_image)[MT9V03X_1_W] = process_image;
     process_image = display_image;
     display_image = temp_image;
@@ -66,54 +89,47 @@ static void image_swap_buffer(void)
     display_line_mid = temp_line_mid;
 }
 
+/* ================== 稳定帧拷贝 ================== */
+
 static void camera_copy_stable_frame(void)
 {
-
+    /* 在 DMA 中断间隙将摄像头图像拷贝到 raw_snapshot，保证处理时不会撕裂 */
     memcpy(raw_snapshot[0], mt9v03x_image_1[0], MT9V03X_1_W * MT9V03X_1_H);
 }
 
-// upward. When one edge disappears (hits image boundary) while the other
-// remains visible, a sharp right-angle turn is detected.
-// Mid-line is then drawn as a straight line from the bottom-centre to the
+/* =============== 直角转弯检测（边界跟踪法） =============== */
 
-// approach in the reference implementation.
-static void detect_boundary_sharp_turn(void)
+/*
+ * 原理：
+ *   从左下往右上逐行扫描，分别跟踪左右边界。
+ *   当某侧边界触及图像边缘（丢失），而另一侧边界依然可见时，判定为直角弯。
+ *   然后用"角点定位"找到边界跳动最大的行，从该行到底部中心画一条斜线作为新中线。
+ *   参考实现来自草莽。
+ */
+static void detect_boundary_sharp_turn(int left_edge[], int right_edge[])
 {
-    int left_edge[MT9V03X_1_H];
-    int right_edge[MT9V03X_1_H];
-    int left_lost_row = -1;
-    int right_lost_row = -1;
-    int left_visible = 0;
-    int right_visible = 0;
+    int left_lost_row = -1;        /* 左侧丢线的起始行，-1 表示未丢 */
+    int right_lost_row = -1;       /* 右侧丢线的起始行 */
+    int left_visible  = 0;         /* 左侧可见的行数统计 */
+    int right_visible = 0;         /* 右侧可见的行数统计 */
 
-    // 1. Extract leftmost and rightmost white pixel per row
+    /* 步骤 1：使用搜线阶段提取的左右边界（已过滤赛道外噪声） */
     for (int i = 0; i < MT9V03X_1_H; i++)
     {
-        int l = -1;
-        int r = -1;
+        int l = left_edge[i];
+        int r = right_edge[i];
 
-        for (int j = 0; j < MT9V03X_1_W; j++)
-        {
-            if (process_image[i][j])
-            {
-                if (l < 0) l = j;
-                r = j;
-            }
-        }
-
-        left_edge[i]  = l;
-        right_edge[i] = r;
-
+        /* 左边界触及图像左边缘 — 判定左侧丢线 */
         if (l >= 0 && l <= SHARP_TURN_EDGE_MARGIN)
         {
-
             if (left_lost_row < 0) left_lost_row = i;
         }
         else if (l > SHARP_TURN_EDGE_MARGIN)
         {
-            left_visible++;
+            left_visible++;  /* 左边界正常可见 */
         }
 
+        /* 右边界触及图像右边缘 — 判定右侧丢线 */
         if (r >= 0 && r >= MT9V03X_1_W - 1 - SHARP_TURN_EDGE_MARGIN)
         {
             if (right_lost_row < 0) right_lost_row = i;
@@ -124,28 +140,27 @@ static void detect_boundary_sharp_turn(void)
         }
     }
 
-    // 2. Decide: is this a sharp turn?
-    // Only trigger when one edge is lost AND the other edge is still clearly
-    // visible (prevents false positives on straights / crosses).
+    /* 步骤 2：判断是否为直角弯（一侧丢线且另一侧可见行数足够多 */
     int is_left_turn  = (left_lost_row >= 0)  && (left_lost_row > MT9V03X_1_H / 2)
-                     && (right_visible > MT9V03X_1_H / 4);
+                        && (right_visible > MT9V03X_1_H / 4);
     int is_right_turn = (right_lost_row >= 0) && (right_lost_row > MT9V03X_1_H / 2)
-                     && (left_visible > MT9V03X_1_H / 4);
+                        && (left_visible > MT9V03X_1_H / 4);
 
     if (!is_left_turn && !is_right_turn)
     {
+        junction_type_from_camera = 0;  /* 未检测到直角弯，清零 */
         turn_dbg_active = 0;
         return;
     }
 
-    junction_type_from_camera = 3;  // sharp turn
+    junction_type_from_camera = 3;  /* 标记为急转弯 */
 
-    // 3. Locate the actual corner row via edge-position derivative.
-    //    The corner is where the disappearing edge jumps fastest toward the
-    //    image boundary (highest per-row position change).  This is more
-    //    precise than the edge-loss row and anchors the diagonal directly
-    //    on the corner rather than somewhere near the top.
-    //    Scan from the bottom upward; row indices increase toward the car.
+    /*
+     * 步骤 3：角点定位
+     *   边界跳动最大的行就是弯角所在行。从底部往上扫描，
+     *   计算每行边界位置的变化率（导数），取最大跳变点。
+     *   比直接用丢线行更精确。
+     */
     int corner_row = MT9V03X_1_H - 1;
     int max_jump   = 0;
     int *edge = is_left_turn ? left_edge : right_edge;
@@ -162,25 +177,30 @@ static void detect_boundary_sharp_turn(void)
         }
     }
 
-    // Fall back to the edge-loss row if no clear corner was found
+    /* 如果跳变不够明显，回退到丢线起始行 */
     if (max_jump < SHARP_TURN_CORNER_DERIV)
     {
         corner_row = is_left_turn ? left_lost_row : right_lost_row;
         if (corner_row < 0) corner_row = MT9V03X_1_H - 1;
     }
 
-    // 4. Generate curve mid-line (reference: Left_curve_line / Right_curve_line).
-    //    Start from the bottom-centre, end at the corner point on the lost edge.
+    /*
+     * 步骤 4：生成斜线中线
+     *   从底部中心画到弯角所在点，以此作为转弯期间的参考中线，
+     *   代替实际丢失的赛道边界。
+     */
     int start_x  = (int)process_line_mid[MT9V03X_1_H - 1];
     int start_y  = MT9V03X_1_H - 1;
     int end_y    = corner_row;
     int end_x    = is_left_turn ? SHARP_TURN_EDGE_MARGIN
                                 : MT9V03X_1_W - 1 - SHARP_TURN_EDGE_MARGIN;
 
+    // 提前探测
+    end_y -= 20;
+    if (end_y < 0) end_y = 0;
     if (end_y > start_y) end_y = start_y;
 
-    // 5. Rasterise the line from (start_x, start_y) to (end_x, end_y)
-    //    and write it into process_line_mid[].
+    /* 步骤 5：用 DDA 光栅化直线，写入 process_line_mid[] */
     int dx = end_x - start_x;
     int dy = end_y - start_y;
     int steps = (abs(dy) > abs(dx)) ? abs(dy) : abs(dx);
@@ -203,7 +223,7 @@ static void detect_boundary_sharp_turn(void)
         y += y_inc;
     }
 
-    // Save debug overlay data for image_display_task
+    /* 保存调试用数据，供 image_display_task 画线 */
     turn_dbg_active  = 1;
     turn_dbg_start_x = start_x;
     turn_dbg_start_y = start_y;
@@ -212,18 +232,26 @@ static void detect_boundary_sharp_turn(void)
     turn_dbg_is_left = is_left_turn;
 }
 
+/* =============== Otsu 大津法自适应二值化 =============== */
+
 static uint8 compute_otsu_threshold(void)
 {
-    // Otsu selects a threshold from the grayscale histogram. It adapts better
-    // than a fixed threshold when track lighting changes.
+    /*
+     * 大津法自动选取最优二值化阈值：
+     *   遍历 0-255 所有灰度级，计算类间方差（between-class variance），
+     *   取方差最大的灰度级作为阈值。
+     *   优点是自适应光照变化，比固定阈值更鲁棒。
+     */
     int histogram[256] = {0};
     int pixel_count = MT9V03X_1_H * MT9V03X_1_W;
     uint8 *img_ptr = &raw_snapshot[0][0];
 
+    /* 统计灰度直方图 */
     for(int i = 0; i < pixel_count; i++) {
         histogram[img_ptr[i]]++;
     }
 
+    /* 计算全局灰度总和，用于后续计算类间方差 */
     int sum = 0;
     for(int i = 0; i < 256; i++) {
         sum += i * histogram[i];
@@ -233,16 +261,18 @@ static uint8 compute_otsu_threshold(void)
     float varMax = 0.0;
     uint8 threshold = 0;
 
+    /* 遍历所有灰度级，找使类间方差最大的阈值 */
     for(int i = 0; i < 256; i++) {
-        wB += histogram[i];
+        wB += histogram[i];            /* 前景像素数 */
         if (wB == 0) continue;
 
-        wF = pixel_count - wB;
+        wF = pixel_count - wB;         /* 背景像素数 */
         if (wF == 0) break;
 
-        sumB += i * histogram[i];
-        int sumF = sum - sumB;
+        sumB += i * histogram[i];      /* 前景灰度累加 */
+        int sumF = sum - sumB;         /* 背景灰度累加 */
 
+        /* 类间方差公式：Var = wB * wF * (uB - uF)^2 */
         float varBetween = (float)sumB * sumB / wB + (float)sumF * sumF / wF;
 
         if (varBetween > varMax) {
@@ -251,11 +281,11 @@ static uint8 compute_otsu_threshold(void)
         }
     }
 
-    // Clamp Otsu result, then apply an exposure-adaptive dark offset.
-
+    /* 对大津法结果做限幅，避免极端值 */
     if(threshold < THRESHOLD_CLAMP_LO) threshold = THRESHOLD_CLAMP_LO;
     if(threshold > THRESHOLD_CLAMP_HI) threshold = THRESHOLD_CLAMP_HI;
 
+    /* 增加曝光自适应偏移（暗场调高阈值压噪，亮场调低保留细节 */
     {
         int range = THRESHOLD_CLAMP_HI - THRESHOLD_CLAMP_LO;
         int offset = THRESHOLD_DARK_MIN
@@ -268,37 +298,41 @@ static uint8 compute_otsu_threshold(void)
     return threshold;
 }
 
+/* =============== 主处理任务 =============== */
+
 void image_process_task(void)
 {
+    /* 检查摄像头一帧是否采集完毕 */
     if (mt9v03x_finish_flag_1 == 1)
     {
-        // The camera driver sets mt9v03x_finish_flag_1 after one full DMA frame.
-        // Clear it first so the next frame can be detected.
         mt9v03x_finish_flag_1 = 0;
 
+        /* 步骤 1：稳定拷贝一帧到 raw_snapshot */
         camera_copy_stable_frame();
 
+        /* 步骤 2：Otsu 自适应二值化 */
         uint8 dynamic_threshold = compute_otsu_threshold();
         uint8 *src = &raw_snapshot[0][0];
         uint8 *dst = &process_image[0][0];
         int count = MT9V03X_1_H * MT9V03X_1_W;
         while (count--)
         {
-#if TRACK_LINE_IS_BLACK
+        #if TRACK_LINE_IS_BLACK
             *dst++ = (*src++ < dynamic_threshold) ? 255 : 0;
-#else
+        #else
             *dst++ = (*src++ > dynamic_threshold) ? 255 : 0;
-#endif
+        #endif
         }
 
-        int lost_line_count = 0; // consecutive lost-line counter
+        int lost_line_count = 0;  /* 本轮连续丢线的行数统计 */
+        int boundary_left[MT9V03X_1_H];   /* 每行赛道左边界，供直角弯检测复用 */
+        int boundary_right[MT9V03X_1_H];  /* 每行赛道右边界，供直角弯检测复用 */
 
+        /* 步骤 3：逐行扫描中线（从近处往远处扫 */
         for (int i = MT9V03X_1_H - 1; i >= 0; i--)
         {
-            // Search starts from the previous row center. This makes the scan
-            // faster and helps reject isolated noise far away from the lane.
+            /* 从上一行中线位置出发搜索，提高速度并抑制噪声 */
             int center_seed = (i == MT9V03X_1_H - 1) ? (MT9V03X_1_W / 2) : process_line_mid[i + 1];
-
             if (center_seed < 0) center_seed = 0;
             if (center_seed >= MT9V03X_1_W) center_seed = MT9V03X_1_W - 1;
 
@@ -306,9 +340,10 @@ void image_process_task(void)
             int left;
             int right;
 
+            /* 从种子点向两侧扩散搜索白色像素 */
             for (int span = 0; span < MT9V03X_1_W / 2; span++)
             {
-                left = center_seed - span;
+                left  = center_seed - span;
                 right = center_seed + span;
 
                 if ((left >= 0) && (process_image[i][left] != 0))
@@ -323,18 +358,26 @@ void image_process_task(void)
                 }
             }
 
+            /* 该行完全找不到赛道 — 丢线，用种子点填充 */
             if (line_pos < 0)
             {
+                boundary_left[i]  = -1;
+                boundary_right[i] = -1;
                 process_line_mid[i] = center_seed;
                 lost_line_count++;
                 continue;
             }
 
+            /* 找到赛道后，向左右扩展找到完整边界 */
             left = line_pos;
             right = line_pos;
             while ((left > 0) && (process_image[i][left] != 0)) left--;
             while ((right < MT9V03X_1_W - 1) && (process_image[i][right] != 0)) right++;
 
+            boundary_left[i]  = left;
+            boundary_right[i] = right;
+
+            /* 如果赛道宽度小于 3 像素，视为噪声，用种子点代替 */
             if (right - left < 3)
             {
                 process_line_mid[i] = center_seed;
@@ -346,10 +389,13 @@ void image_process_task(void)
             }
         }
 
-        detect_boundary_sharp_turn();
+        /* 步骤 4：检测直角弯（复用搜线阶段的左右边界，过滤赛道外噪声 */
+        detect_boundary_sharp_turn(boundary_left, boundary_right);
 
         line_lost_count = (lost_line_count > 255) ? 255 : (uint8)lost_line_count;
 
+        /* 步骤 5：加权平均计算赛道偏移量（近处行权重大）
+         *   只取画面中间段（1/3 到 5/6），忽略顶部太远的行和底部太近的行 */
         {
             int32 sum = 0;
             int32 weight_sum = 0;
@@ -358,23 +404,26 @@ void image_process_task(void)
 
             for (int i = start; i < end; i++)
             {
-                int weight = i;
+                int weight = i;  /* 越靠近底部的行权重越大 */
                 sum += (process_line_mid[i] - (MT9V03X_1_W / 2)) * weight;
                 weight_sum += weight;
             }
             track_offset = (weight_sum > 0) ? (int16)(sum / weight_sum) : 0;
         }
 
+        /* 步骤 6：将结果同步到对外数组给 motor.c 使用 */
         for (int i = 0; i < MT9V03X_1_H; i++)
         {
             line_mid[i] = process_line_mid[i];
         }
 
-        // 7. 浜ゆ崲鏄剧ず缂撳啿
+        /* 步骤 7：交换处理/显示缓冲区 */
         image_swap_buffer();
         image_ready = 1;
     }
 }
+
+/* =============== 显示任务 =============== */
 
 void image_display_task(void)
 {
@@ -382,21 +431,35 @@ void image_display_task(void)
     static uint8 refresh_cnt = 0;
     if (!image_ready) return;
 
-    // IPS200 refresh is slow compared with image processing, so only show
-    // every third processed frame. Set ENABLE_DISPLAY to 0 for race runs.
-    if (++refresh_cnt < 3) return; // skip 2 of 3 frames
+    /* 降低显示刷新率（每 3 帧显示一次），为图像处理腾出 CPU */
+    if (++refresh_cnt < 3) return;
     refresh_cnt = 0;
 
+    /* 显示二值化后的摄像头图像 */
     ips200_show_gray_image(0, 0, display_image[0], MT9V03X_1_W, MT9V03X_1_H, MT9V03X_1_W, MT9V03X_1_H, 0);
 
+    /* 用红点画中线、蓝点画左边界、绿点画右边界 */
     for (int i = 0; i < MT9V03X_1_H; i++)
     {
         if ((display_line_mid[i] >= 0) && (display_line_mid[i] < MT9V03X_1_W))
         {
             ips200_draw_point((uint16)display_line_mid[i], (uint16)i, RGB565_RED);
         }
+
+        int l = -1, r = -1;
+        for (int j = 0; j < MT9V03X_1_W; j++)
+        {
+            if (display_image[i][j])
+            {
+                if (l < 0) l = j;
+                r = j;
+            }
+        }
+        if (l >= 0) ips200_draw_point((uint16)l, (uint16)i, RGB565_CYAN);
+        if (r >= 0 && r > l) ips200_draw_point((uint16)r, (uint16)i, RGB565_YELLOW);
     }
 
+    /* IMU 陀螺仪数据显示在摄像头图像下方 */
     ips200_set_font(IPS200_6X8_FONT);
     ips200_set_color(RGB565_RED, RGB565_WHITE);
     ips200_show_string(0, 122, "GZ");
@@ -406,35 +469,42 @@ void image_display_task(void)
     ips200_show_string(108, 122, "GX");
     ips200_show_int(126, 122, (int32)(gyro[0] * 57.3f), 4);
 
+    ips200_show_string(0, 140, "T:");
+    ips200_show_int(18, 140, Task1_GetCount(), 2);
+    ips200_show_string(36, 140, "/");
+    ips200_show_int(42, 140, TASK1_TURN_TARGET, 2);
+
 #if ENABLE_TURN_DEBUG
-    // Sharp-turn detection debug overlay (read-only, does not affect motor)
+    /* 直角弯诊断叠加层 */
     if (turn_dbg_active)
     {
-        // Draw the generated diagonal mid-line in CYAN
+        /* 青色斜线表示生成的转弯中线 */
         ips200_draw_line((uint16)turn_dbg_start_x, (uint16)turn_dbg_start_y,
                          (uint16)turn_dbg_end_x,   (uint16)turn_dbg_end_y,
                          RGB565_CYAN);
 
-        // Mark start point (bottom centre) in GREEN
+        /* 绿色点标记起点（底部中心） */
         ips200_draw_point((uint16)turn_dbg_start_x, (uint16)turn_dbg_start_y, RGB565_GREEN);
 
-        // Mark end point (corner aim) in YELLOW
+        /* 黄色点标记终点（弯角瞄准点） */
         ips200_draw_point((uint16)turn_dbg_end_x, (uint16)turn_dbg_end_y, RGB565_YELLOW);
 
-        // Show junction type text at top-right
+        /* 右上角显示转弯方向 */
         if (turn_dbg_is_left)
         {
-            ips200_show_string(MT9V03X_1_W - 30, 0, "LT");
+            ips200_show_string(MT9V03X_1_W - 30, 0, "LT"); /* Left Turn */
         }
         else
         {
-            ips200_show_string(MT9V03X_1_W - 30, 0, "RT");
+            ips200_show_string(MT9V03X_1_W - 30, 0, "RT"); /* Right Turn */
         }
     }
 #endif
 
 #endif
 }
+
+/* ====================== 对外接口 ====================== */
 
 int16 Camera_GetTrackOffset(void)
 {

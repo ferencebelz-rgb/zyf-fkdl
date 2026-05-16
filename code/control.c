@@ -3,6 +3,7 @@
 #include "imu.h"
 #include "motor.h"
 #include "pid.h"
+#include "task1.h"
 #include "zf_device_ips200.h"
 #include <stdlib.h>
 
@@ -59,6 +60,7 @@ void Control_Init(void)
     IncrementalPI_Init(&speed_pid_l, speed_kp, speed_ki);
     IncrementalPI_Init(&speed_pid_r, speed_kp, speed_ki);
     PositionPD_Init(&turn_pid, turn_kp, turn_kd);
+    Task1_Init();
     control_reset_runtime();
 }
 
@@ -168,6 +170,40 @@ static void update_targets_from_camera(void)
     float error;
     float turn;
 
+    // 进弯用3帧确认，出弯靠IMU偏航角变化超过60度判断
+    static uint8  turn_entry_cnt = 0;  // 连续检测帧数
+    static uint8  turn_active = 0;     // 是否处于直角弯状态
+    static float turn_entry_yaw = 0;   // 进弯时的偏航角
+
+    if (junction_type_from_camera >= 3)
+    {
+        if (turn_entry_cnt < 255) turn_entry_cnt++;
+    }
+    else
+    {
+        turn_entry_cnt = 0;
+    }
+
+    if (!turn_active)
+    {
+        if (turn_entry_cnt >= 3)
+        {
+            turn_active = 1;
+            turn_entry_yaw = imu_yaw;
+        }
+    }
+    else
+    {
+        // 计算偏航角变化（处理0-360回绕）
+        float dyaw = imu_yaw - turn_entry_yaw;
+        if (dyaw < 0) dyaw = -dyaw;
+        if (dyaw > 180.0f) dyaw = 360.0f - dyaw;
+        if (dyaw >= 60.0f)
+        {
+            turn_active = 0;
+        }
+    }
+
     base_speed_target = approach_i16(base_speed_target, base_speed_cmd, CONTROL_BASE_RAMP_STEP);
 
 #if (CONTROL_STRAIGHT_ONLY == 1)
@@ -181,10 +217,10 @@ static void update_targets_from_camera(void)
     if(turn_limit > base_speed_target) turn_limit = base_speed_target;
     turn_output = clamp_i16((int32)turn, -turn_limit, turn_limit);
 
-    // Boost turn differential 1.5x on L-junction or sharp right-angle turn
-    if (junction_type_from_camera >= 2)
+    // Boost turn on confirmed sharp right-angle turn
+    if (turn_active)
     {
-        turn_output = (int16)(turn_output * 3 / 2);
+        turn_output = (int16)(turn_output * 5);
         turn_output = clamp_i16((int32)turn_output, -turn_limit, turn_limit);
     }
 #endif
@@ -237,6 +273,13 @@ void Control_Task10ms(void)
                                   &cooldown_r);
 
     Motor_SetPWM(pwm_l, pwm_r);
+
+    Task1_Update();
+    if (Task1_IsFinished())
+    {
+        base_speed_cmd = 0;
+        control_reset_runtime();
+    }
 }
 
 void Control_DisplayStatusTask(void)

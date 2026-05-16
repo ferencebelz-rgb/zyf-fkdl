@@ -6,7 +6,7 @@
 #define CONTROL_STRAIGHT_ONLY           0
 #define CONTROL_TURN_SIGN               1
 
-#define CONTROL_BASE_SPEED_DEFAULT      288
+#define CONTROL_BASE_SPEED_DEFAULT      432
 #define CONTROL_BASE_SPEED_MAX          600
 #define CONTROL_BASE_RAMP_STEP          4
 
