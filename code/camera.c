@@ -429,6 +429,32 @@ void image_process_task(void)
             }
         }
 
+        // 黑区补线：取丢失段前后各5行的有效中线，直线连接
+        {
+            uint8 lost_flag[MT9V03X_1_H];
+            for (int i = 0; i < MT9V03X_1_H; i++)
+                lost_flag[i] = (boundary_left[i] < 0) ? 1 : 0;
+
+            for (int i = 1; i < MT9V03X_1_H - 1; )
+            {
+                if (!lost_flag[i]) { i++; continue; }
+                int gap_start = i;
+                while (i < MT9V03X_1_H - 1 && lost_flag[i]) i++;
+                int gap_end = i - 1;
+                if (gap_start < 5 || gap_end >= MT9V03X_1_H - 6) continue;
+
+                int16 val_before = process_line_mid[gap_start - 5];
+                int16 val_after  = process_line_mid[gap_end + 5];
+                if (val_before < 0 || val_after < 0) continue;
+
+                for (int r = gap_start; r <= gap_end; r++)
+                {
+                    process_line_mid[r] = val_before
+                        + (int16)((val_after - val_before) * (r - (gap_start - 5)) / (gap_end + 5 - (gap_start - 5) + 1));
+                }
+            }
+        }
+
         /* 步骤 4：检测直角弯（复用搜线阶段的左右边界，过滤赛道外噪声 */
         detect_boundary_sharp_turn(boundary_left, boundary_right);
 

@@ -25,6 +25,7 @@ static float turn_kp = CONTROL_TURN_KP_DEFAULT;
 static float turn_kd = CONTROL_TURN_KD_DEFAULT;
 
 static uint8 fault_stop = 0;
+static uint16 start_ticks = 0;  /* 起步计时 (10ms/tick) */
 
 static uint16 stall_count_l = 0;
 static uint16 stall_count_r = 0;
@@ -61,6 +62,7 @@ void Control_Init(void)
     IncrementalPI_Init(&speed_pid_r, speed_kp, speed_ki);
     PositionPD_Init(&turn_pid, turn_kp, turn_kd);
     Task1_Init();
+    start_ticks = 0;
     control_reset_runtime();
 }
 
@@ -260,6 +262,15 @@ void Control_Task10ms(void)
 
     update_targets_from_camera();
 
+    // 起步 500ms 内速度环 PID 参数翻倍，线性衰减
+    if (start_ticks < 250) start_ticks++;
+    if (start_ticks <= 50)
+    {
+        float boost = 1.0f + (50.0f - (float)start_ticks) / 50.0f;
+        IncrementalPI_SetParam(&speed_pid_l, speed_kp * boost, speed_ki * boost);
+        IncrementalPI_SetParam(&speed_pid_r, speed_kp * boost, speed_ki * boost);
+    }
+
     pwm_l = update_one_speed_loop(&speed_pid_l,
                                   target_l,
                                   speed_l,
@@ -272,6 +283,12 @@ void Control_Task10ms(void)
                                   pwm_r,
                                   &stall_count_r,
                                   &cooldown_r);
+
+    if (start_ticks <= 50)
+    {
+        IncrementalPI_SetParam(&speed_pid_l, speed_kp, speed_ki);
+        IncrementalPI_SetParam(&speed_pid_r, speed_kp, speed_ki);
+    }
 
     Motor_SetPWM(pwm_l, pwm_r);
 

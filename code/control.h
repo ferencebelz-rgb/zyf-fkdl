@@ -6,12 +6,12 @@
 #define CONTROL_STRAIGHT_ONLY           0
 #define CONTROL_TURN_SIGN               1
 
-#define CONTROL_BASE_SPEED_DEFAULT      500
+#define CONTROL_BASE_SPEED_DEFAULT      600
 #define CONTROL_BASE_SPEED_MAX          900
 #define CONTROL_BASE_RAMP_STEP          4
 
-#define CONTROL_TURN_KP_DEFAULT         1.2f
-#define CONTROL_TURN_KD_DEFAULT         0.3f
+#define CONTROL_TURN_KP_DEFAULT         2.028f
+#define CONTROL_TURN_KD_DEFAULT         0.507f
 #define CONTROL_TURN_LIMIT_DEFAULT      180
 #define CONTROL_GYRO_DAMPING_GAIN       7.5f
 

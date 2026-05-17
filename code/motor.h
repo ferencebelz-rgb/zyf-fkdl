@@ -28,8 +28,8 @@
 #define ENCODER_L_SIGN       (-1)
 #define ENCODER_R_SIGN       (1)
 
-#define SPEED_KP_DEFAULT    2.0f
-#define SPEED_KI_DEFAULT    0.6f
+#define SPEED_KP_DEFAULT    2.3f
+#define SPEED_KI_DEFAULT    0.888f
 
 #define MAX_PWM             6666
 #define PWM_STEP_LIMIT      200

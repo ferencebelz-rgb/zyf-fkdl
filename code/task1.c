@@ -22,7 +22,7 @@ void Task1_Update(void)
     /* 达标后开始倒计时 */
     if (turn_count >= TASK1_TURN_TARGET)
     {
-        if (stop_delay < 1000)
+        if (stop_delay < 666)
         {
             stop_delay += 10;  /* 每次调用 +10ms */
         }
@@ -36,5 +36,5 @@ uint8 Task1_GetCount(void)
 
 uint8 Task1_IsFinished(void)
 {
-    return (stop_delay >= 1000) ? 1 : 0;
+    return (stop_delay >= 666) ? 1 : 0;
 }
