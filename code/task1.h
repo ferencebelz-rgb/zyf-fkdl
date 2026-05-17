@@ -3,9 +3,10 @@
 
 #include "zf_common_headfile.h"
 
-#define TASK1_TURN_TARGET  8     /* 目标直角弯个数 */
+#define TASK1_TURN_TARGET  2     /* 目标直角弯个数 */
 
 void Task1_Init(void);
+void Task1_CountTurn(void);
 void Task1_Update(void);
 uint8 Task1_GetCount(void);
 uint8 Task1_IsFinished(void);

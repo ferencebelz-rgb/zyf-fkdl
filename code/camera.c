@@ -223,6 +223,12 @@ static void detect_boundary_sharp_turn(int left_edge[], int right_edge[])
         y += y_inc;
     }
 
+    // 斜线上方行统一指向终点，消除黑色区域残留红线
+    for (int row = 0; row < end_y; row++)
+    {
+        process_line_mid[row] = (int16)end_x;
+    }
+
     /* 保存调试用数据，供 image_display_task 画线 */
     turn_dbg_active  = 1;
     turn_dbg_start_x = start_x;
@@ -322,6 +328,40 @@ void image_process_task(void)
         #else
             *dst++ = (*src++ > dynamic_threshold) ? 255 : 0;
         #endif
+        }
+
+        // 3x3 去噪：孤立白点（邻域白点数 < 2）视为噪声抹掉
+        {
+            static uint8 clean[MT9V03X_1_H][MT9V03X_1_W];  /* 放静态区，避免栈溢出 */
+            for (int y = 1; y < MT9V03X_1_H - 1; y++)
+            {
+                for (int x = 1; x < MT9V03X_1_W - 1; x++)
+                {
+                    if (!process_image[y][x]) { clean[y][x] = 0; continue; }
+                    int nb = 0;
+                    if (process_image[y-1][x-1]) nb++;
+                    if (process_image[y-1][x  ]) nb++;
+                    if (process_image[y-1][x+1]) nb++;
+                    if (process_image[y  ][x-1]) nb++;
+                    if (process_image[y  ][x+1]) nb++;
+                    if (process_image[y+1][x-1]) nb++;
+                    if (process_image[y+1][x  ]) nb++;
+                    if (process_image[y+1][x+1]) nb++;
+                    clean[y][x] = (nb >= 2) ? 255 : 0;
+                }
+            }
+            // 边界行/列保持不变
+            for (int x = 0; x < MT9V03X_1_W; x++)
+            {
+                clean[0][x] = process_image[0][x];
+                clean[MT9V03X_1_H-1][x] = process_image[MT9V03X_1_H-1][x];
+            }
+            for (int y = 0; y < MT9V03X_1_H; y++)
+            {
+                clean[y][0] = process_image[y][0];
+                clean[y][MT9V03X_1_W-1] = process_image[y][MT9V03X_1_W-1];
+            }
+            memcpy(&process_image[0][0], &clean[0][0], MT9V03X_1_H * MT9V03X_1_W);
         }
 
         int lost_line_count = 0;  /* 本轮连续丢线的行数统计 */

@@ -201,6 +201,7 @@ static void update_targets_from_camera(void)
         if (dyaw >= 60.0f)
         {
             turn_active = 0;
+            Task1_CountTurn();  /* IMU 确认转弯完成，计一次 */
         }
     }
 
