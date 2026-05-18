@@ -2,6 +2,7 @@
 #pragma section all "cpu0_dsram"
 
 #include "camera.h"
+#include "control.h"
 #include "fan.h"
 #include "imu.h"
 #include "motor.h"
@@ -65,7 +66,17 @@ int core0_main(void)
     {
         key_scanner();
 
-        // KEY4 运行中切换负压风扇
+        // KEY1 切换任务模式1 / KEY2 切换任务模式2 / KEY4 切换负压风扇
+        if(key_get_state(KEY_1) == KEY_SHORT_PRESS)
+        {
+            key_clear_state(KEY_1);
+            Control_SetTaskMode(TASK_MODE_1);
+        }
+        if(key_get_state(KEY_2) == KEY_SHORT_PRESS)
+        {
+            key_clear_state(KEY_2);
+            Control_SetTaskMode(TASK_MODE_2);
+        }
         if(key_get_state(KEY_4) == KEY_SHORT_PRESS)
         {
             key_clear_state(KEY_4);

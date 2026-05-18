@@ -13,6 +13,7 @@
 #include "camera.h"
 #include "imu.h"
 #include "task1.h"
+#include "task2.h"
 #include "zf_device_ips200.h"
 #include "zf_device_mt9v03x_double.h"
 #include "zf_driver_dma.h"
@@ -36,7 +37,7 @@
 
 int16 line_mid[MT9V03X_1_H];         /* 各行的中线列坐标，供 control.c 前视用 */
 int16 track_offset = 0;              /* 赛道偏移量（像素），供 control.c 转向用 */
-uint8 junction_type_from_camera = 0; /* 0=直道 1=T/直角 2=十字/L 3=急转弯 */
+uint8 junction_type_from_camera = 0; /* 0=直道 1=T字路口 2=十字路口 3=急转弯/直角弯 */
 static uint8 line_lost_count = 0;    /* 连续丢线行数统计 */
 
 /* =================== 双缓冲缓冲区定义 =================== */
@@ -238,6 +239,185 @@ static void detect_boundary_sharp_turn(int left_edge[], int right_edge[])
     turn_dbg_is_left = is_left_turn;
 }
 
+/* =============== 十字路口与T字路口检测 =============== */
+
+/*
+ * 原理（参考草莽）：
+ *   统计四边缘（底/顶/左/右）的边界丢失情况。
+ *   四边缘全丢 = 十字路口 → 底部中线垂直向上直行。
+ *   底+顶丢失、左右正常 = T字路口 → 底部中线垂直向上直行。
+ *   底+左/右丢失已由直角弯检测处理。
+ */
+static void detect_cross_t_junction(int left_edge[], int right_edge[])
+{
+    int h = MT9V03X_1_H;
+    int w = MT9V03X_1_W;
+    int margin = 3;
+    int i;
+
+    static uint8 tjun_active = 0;  /* 同一T字路口不重复查询方向 */
+    static int8  tjun_saved_dir = 0;
+
+    /* ---- 统计四边缘丢失像素数 ---- */
+    int b_lost = 0;  /* 底边：最下面 8 行左右边界均触边 */
+    for (i = h - 1; i >= h - 8 && i >= 0; i--)
+    {
+        if (left_edge[i] >= 0 && left_edge[i] <= margin &&
+            right_edge[i] >= 0 && right_edge[i] >= w - 1 - margin)
+            b_lost++;
+    }
+
+    int t_lost = 0;  /* 顶边：最上面 8 行左右边界均丢失或触边 */
+    for (i = 0; i < 8 && i < h; i++)
+    {
+        if (left_edge[i] < 0 || right_edge[i] < 0)
+            t_lost++;
+        else if (left_edge[i] <= margin && right_edge[i] >= w - 1 - margin)
+            t_lost++;
+    }
+
+    int l_lost = 0;  /* 左边：中间段左边界触左边缘 */
+    for (i = h / 4; i < h * 3 / 4; i++)
+    {
+        if (left_edge[i] >= 0 && left_edge[i] <= margin)
+            l_lost++;
+    }
+
+    int r_lost = 0;  /* 右边：中间段右边界触右边缘 */
+    for (i = h / 4; i < h * 3 / 4; i++)
+    {
+        if (right_edge[i] >= 0 && right_edge[i] >= w - 1 - margin)
+            r_lost++;
+    }
+
+    int b_flag = (b_lost >= 4);          /* 底边丢失 */
+    int t_flag = (t_lost >= 4);          /* 顶边丢失 */
+    int l_flag = (l_lost >= h / 8);      /* 左边丢失 */
+    int r_flag = (r_lost >= h / 8);      /* 右边丢失 */
+
+    /* 十字路口：四边全丢 */
+    if (b_flag && t_flag && l_flag && r_flag)
+    {
+        junction_type_from_camera = 2;
+
+        /* 取底部有效中线的 x 坐标，垂直向上画线穿过路口 */
+        int16 cx = process_line_mid[h - 1];
+        if (cx < 0 || cx >= w) cx = w / 2;
+
+        for (i = 0; i < h; i++)
+        {
+            process_line_mid[i] = cx;
+        }
+        return;
+    }
+
+    /* T字路口：底+顶丢失，左右均可见 */
+    if (b_flag && t_flag && !l_flag && !r_flag)
+    {
+        if (!tjun_active)
+        {
+            tjun_active = 1;
+            tjun_saved_dir = Task2_GetTJunTurnDir(); /* 查表获取本次转弯方向 */
+        }
+
+        if (tjun_saved_dir == TURN_LEFT)
+        {
+            /* 左转 → 标记为急转弯，画斜线到左边缘 */
+            junction_type_from_camera = 3;
+
+            int start_x = (int)process_line_mid[h - 1];
+            int start_y = h - 1;
+            int end_y   = h / 3;
+            int end_x   = margin;
+
+            end_y -= 10;
+            if (end_y < 0) end_y = 0;
+            if (end_y > start_y) end_y = start_y;
+
+            int dx = end_x - start_x;
+            int dy = end_y - start_y;
+            int steps = (abs(dy) > abs(dx)) ? abs(dy) : abs(dx);
+            if (steps < 1) steps = 1;
+            float x_inc = (float)dx / (float)steps;
+            float y_inc = (float)dy / (float)steps;
+            float x = (float)start_x;
+            float y = (float)start_y;
+            for (int s = 0; s <= steps; s++)
+            {
+                int row = (int)(y + 0.5f);
+                int col = (int)(x + 0.5f);
+                if (row >= 0 && row < h && col >= 0 && col < w)
+                    process_line_mid[row] = (int16)col;
+                x += x_inc;
+                y += y_inc;
+            }
+            for (int r = 0; r < end_y; r++)
+                process_line_mid[r] = (int16)end_x;
+        }
+        else if (tjun_saved_dir == TURN_RIGHT)
+        {
+            /* 右转 → 标记为急转弯，画斜线到右边缘 */
+            junction_type_from_camera = 3;
+
+            int start_x = (int)process_line_mid[h - 1];
+            int start_y = h - 1;
+            int end_y   = h / 3;
+            int end_x   = w - 1 - margin;
+
+            end_y -= 10;
+            if (end_y < 0) end_y = 0;
+            if (end_y > start_y) end_y = start_y;
+
+            int dx = end_x - start_x;
+            int dy = end_y - start_y;
+            int steps = (abs(dy) > abs(dx)) ? abs(dy) : abs(dx);
+            if (steps < 1) steps = 1;
+            float x_inc = (float)dx / (float)steps;
+            float y_inc = (float)dy / (float)steps;
+            float x = (float)start_x;
+            float y = (float)start_y;
+            for (int s = 0; s <= steps; s++)
+            {
+                int row = (int)(y + 0.5f);
+                int col = (int)(x + 0.5f);
+                if (row >= 0 && row < h && col >= 0 && col < w)
+                    process_line_mid[row] = (int16)col;
+                x += x_inc;
+                y += y_inc;
+            }
+            for (int r = 0; r < end_y; r++)
+                process_line_mid[r] = (int16)end_x;
+        }
+        else
+        {
+            /* 直行 */
+            junction_type_from_camera = 1;
+
+            int16 cx = process_line_mid[h - 1];
+            if (cx < 0 || cx >= w) cx = w / 2;
+            for (i = 0; i < h; i++)
+                process_line_mid[i] = cx;
+        }
+        return;
+    }
+    else
+    {
+        tjun_active = 0;  /* 离开T字路口，下次进入时重新查询方向 */
+    }
+
+    /* T字路口含侧向出口：底+顶+左 或 底+顶+右 → 交给直角弯检测 */
+    if (b_flag && t_flag && l_flag && !r_flag)
+    {
+        junction_type_from_camera = 3;
+        return;
+    }
+    if (b_flag && t_flag && !l_flag && r_flag)
+    {
+        junction_type_from_camera = 3;
+        return;
+    }
+}
+
 /* =============== Otsu 大津法自适应二值化 =============== */
 
 static uint8 compute_otsu_threshold(void)
@@ -368,6 +548,8 @@ void image_process_task(void)
         int boundary_left[MT9V03X_1_H];   /* 每行赛道左边界，供直角弯检测复用 */
         int boundary_right[MT9V03X_1_H];  /* 每行赛道右边界，供直角弯检测复用 */
 
+        int gap_start = -1;  /* 当前空隙的底部行号，-1 表示不在空隙中 */
+
         /* 步骤 3：逐行扫描中线（从近处往远处扫 */
         for (int i = MT9V03X_1_H - 1; i >= 0; i--)
         {
@@ -401,6 +583,7 @@ void image_process_task(void)
             /* 该行完全找不到赛道 — 丢线，用种子点填充 */
             if (line_pos < 0)
             {
+                if (gap_start < 0) gap_start = i;
                 boundary_left[i]  = -1;
                 boundary_right[i] = -1;
                 process_line_mid[i] = center_seed;
@@ -420,13 +603,31 @@ void image_process_task(void)
             /* 如果赛道宽度小于 3 像素，视为噪声，用种子点代替 */
             if (right - left < 3)
             {
+                if (gap_start < 0) gap_start = i;
                 process_line_mid[i] = center_seed;
                 lost_line_count++;
+                continue;
             }
-            else
+
+            int mid = (int16)((left + right) / 2);
+
+            /* 刚退出一个小空隙（≤10 行），用上下有效中线线性插值补齐 */
+            if (gap_start >= 0)
             {
-                process_line_mid[i] = (int16)((left + right) / 2);
+                int gap_size = gap_start - i;
+                if (gap_size <= 20 && gap_start < MT9V03X_1_H - 1)
+                {
+                    int mid_below = process_line_mid[gap_start + 1];
+                    for (int j = gap_start; j > i; j--)
+                    {
+                        float t = (float)(gap_start - j) / (float)gap_size;
+                        process_line_mid[j] = (int16)(mid_below + (mid - mid_below) * t);
+                    }
+                }
+                gap_start = -1;
             }
+
+            process_line_mid[i] = mid;
         }
 
         // 黑区补线：取丢失段前后各5行的有效中线，直线连接
@@ -457,6 +658,12 @@ void image_process_task(void)
 
         /* 步骤 4：检测直角弯（复用搜线阶段的左右边界，过滤赛道外噪声 */
         detect_boundary_sharp_turn(boundary_left, boundary_right);
+
+        /* 步骤 4.5：检测十字路口与T字路口（参考草莽四边缘丢失法） */
+        if (junction_type_from_camera == 0)
+        {
+            detect_cross_t_junction(boundary_left, boundary_right);
+        }
 
         line_lost_count = (lost_line_count > 255) ? 255 : (uint8)lost_line_count;
 

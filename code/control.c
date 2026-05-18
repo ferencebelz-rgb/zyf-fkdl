@@ -4,6 +4,7 @@
 #include "motor.h"
 #include "pid.h"
 #include "task1.h"
+#include "task2.h"
 #include "zf_device_ips200.h"
 #include <stdlib.h>
 
@@ -26,6 +27,7 @@ static float turn_kd = CONTROL_TURN_KD_DEFAULT;
 
 static uint8 fault_stop = 0;
 static uint16 start_ticks = 0;  /* 起步计时 (10ms/tick) */
+static task_mode_t active_mode = TASK_MODE_1;
 
 static uint16 stall_count_l = 0;
 static uint16 stall_count_r = 0;
@@ -62,6 +64,8 @@ void Control_Init(void)
     IncrementalPI_Init(&speed_pid_r, speed_kp, speed_ki);
     PositionPD_Init(&turn_pid, turn_kp, turn_kd);
     Task1_Init();
+    Task2_Init();
+    active_mode = TASK_MODE_1;
     start_ticks = 0;
     control_reset_runtime();
 }
@@ -203,7 +207,11 @@ static void update_targets_from_camera(void)
         if (dyaw >= 60.0f)
         {
             turn_active = 0;
-            Task1_CountTurn();  /* IMU 确认转弯完成，计一次 */
+            /* 根据当前模式路由到对应任务 */
+            if (active_mode == TASK_MODE_1)
+                Task1_CountTurn();
+            else
+                Task2_CountTurn();
         }
     }
 
@@ -293,10 +301,22 @@ void Control_Task10ms(void)
     Motor_SetPWM(pwm_l, pwm_r);
 
     Task1_Update();
-    if (Task1_IsFinished())
+    Task2_Update();
+    if (active_mode == TASK_MODE_1)
     {
-        base_speed_cmd = 0;
-        control_reset_runtime();
+        if (Task1_IsFinished())
+        {
+            base_speed_cmd = 0;
+            control_reset_runtime();
+        }
+    }
+    else
+    {
+        if (Task2_IsFinished())
+        {
+            base_speed_cmd = 0;
+            control_reset_runtime();
+        }
     }
 }
 
@@ -310,3 +330,18 @@ int16 Control_GetTargetL(void) { return target_l; }
 int16 Control_GetTargetR(void) { return target_r; }
 int16 Control_GetTurnOutput(void) { return turn_output; }
 uint8 Control_GetFaultStop(void) { return fault_stop; }
+
+void Control_SetTaskMode(task_mode_t mode)
+{
+    if (mode == active_mode) return;
+    active_mode = mode;
+    if (mode == TASK_MODE_1)
+        Task1_Init();
+    else
+        Task2_Init();
+}
+
+task_mode_t Control_GetTaskMode(void)
+{
+    return active_mode;
+}

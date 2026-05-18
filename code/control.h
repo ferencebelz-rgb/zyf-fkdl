@@ -15,10 +15,18 @@
 #define CONTROL_TURN_LIMIT_DEFAULT      180
 #define CONTROL_GYRO_DAMPING_GAIN       7.5f
 
+typedef enum
+{
+    TASK_MODE_1 = 0,
+    TASK_MODE_2 = 1,
+} task_mode_t;
+
 void Control_Init(void);
 void Control_Task10ms(void);
 void Control_DisplayStatusTask(void);
 void Control_ClearFault(void);
+void Control_SetTaskMode(task_mode_t mode);
+task_mode_t Control_GetTaskMode(void);
 
 int16 Control_GetBaseSpeedCommand(void);
 int16 Control_GetBaseSpeedTarget(void);
