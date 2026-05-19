@@ -11,6 +11,7 @@
  */
 
 #include "camera.h"
+#include "control.h"
 #include "imu.h"
 #include "task1.h"
 #include "task2.h"
@@ -18,6 +19,19 @@
 #include "zf_device_mt9v03x_double.h"
 #include "zf_driver_dma.h"
 #include <string.h>
+
+#define EXIT_SIDE_MIN_ROWS           6
+#define EXIT_ROI_LEFT                (MT9V03X_1_W / 6)
+#define EXIT_ROI_RIGHT               (MT9V03X_1_W * 5 / 6)
+#define EXIT_ROI_TOP                 (MT9V03X_1_H / 6)
+#define EXIT_ROI_BOTTOM              (MT9V03X_1_H * 5 / 6)
+#define EXIT_EDGE_MARGIN             3
+#define FRONT_TOP_ROWS               6
+#define FRONT_HALF_WIDTH             10
+#define FRONT_ROW_MIN_PIXELS         4
+#define FRONT_EXIT_MIN_ROWS          3
+#define JUNCTION_MISSING_UNLOCK_FRAMES 3
+#define ROUTE_AIM_ADVANCE_ROWS       20
 
 /* ======================== 编译开关 ======================== */
 
@@ -67,6 +81,11 @@ static int  turn_dbg_end_x   = 0;
 static int  turn_dbg_end_y   = 0;
 static int  turn_dbg_is_left = 0;
 
+/* 路口检测状态（control.c 和显示共用 */
+static junction_kind_t   current_junction_kind   = JUNCTION_NONE;
+static route_decision_t  current_route_decision  = DECISION_STRAIGHT;
+static uint8             junction_error          = 0;
+
 /* ==================== 初始化函数 ==================== */
 
 void cam_init(void)
@@ -98,146 +117,6 @@ static void camera_copy_stable_frame(void)
     memcpy(raw_snapshot[0], mt9v03x_image_1[0], MT9V03X_1_W * MT9V03X_1_H);
 }
 
-/* =============== 直角转弯检测（边界跟踪法） =============== */
-
-/*
- * 原理：
- *   从左下往右上逐行扫描，分别跟踪左右边界。
- *   当某侧边界触及图像边缘（丢失），而另一侧边界依然可见时，判定为直角弯。
- *   然后用"角点定位"找到边界跳动最大的行，从该行到底部中心画一条斜线作为新中线。
- *   参考实现来自草莽。
- */
-static void detect_boundary_sharp_turn(int left_edge[], int right_edge[])
-{
-    int left_lost_row = -1;        /* 左侧丢线的起始行，-1 表示未丢 */
-    int right_lost_row = -1;       /* 右侧丢线的起始行 */
-    int left_visible  = 0;         /* 左侧可见的行数统计 */
-    int right_visible = 0;         /* 右侧可见的行数统计 */
-
-    /* 步骤 1：使用搜线阶段提取的左右边界（已过滤赛道外噪声） */
-    for (int i = 0; i < MT9V03X_1_H; i++)
-    {
-        int l = left_edge[i];
-        int r = right_edge[i];
-
-        /* 左边界触及图像左边缘 — 判定左侧丢线 */
-        if (l >= 0 && l <= SHARP_TURN_EDGE_MARGIN)
-        {
-            if (left_lost_row < 0) left_lost_row = i;
-        }
-        else if (l > SHARP_TURN_EDGE_MARGIN)
-        {
-            left_visible++;  /* 左边界正常可见 */
-        }
-
-        /* 右边界触及图像右边缘 — 判定右侧丢线 */
-        if (r >= 0 && r >= MT9V03X_1_W - 1 - SHARP_TURN_EDGE_MARGIN)
-        {
-            if (right_lost_row < 0) right_lost_row = i;
-        }
-        else if (r >= 0 && r < MT9V03X_1_W - 1 - SHARP_TURN_EDGE_MARGIN)
-        {
-            right_visible++;
-        }
-    }
-
-    /* 步骤 2：判断是否为直角弯（一侧丢线且另一侧可见行数足够多 */
-    int is_left_turn  = (left_lost_row >= 0)  && (left_lost_row > MT9V03X_1_H / 2)
-                        && (right_visible > MT9V03X_1_H / 4);
-    int is_right_turn = (right_lost_row >= 0) && (right_lost_row > MT9V03X_1_H / 2)
-                        && (left_visible > MT9V03X_1_H / 4);
-
-    if (!is_left_turn && !is_right_turn)
-    {
-        junction_type_from_camera = 0;  /* 未检测到直角弯，清零 */
-        turn_dbg_active = 0;
-        return;
-    }
-
-    junction_type_from_camera = 3;  /* 标记为急转弯 */
-
-    /*
-     * 步骤 3：角点定位
-     *   边界跳动最大的行就是弯角所在行。从底部往上扫描，
-     *   计算每行边界位置的变化率（导数），取最大跳变点。
-     *   比直接用丢线行更精确。
-     */
-    int corner_row = MT9V03X_1_H - 1;
-    int max_jump   = 0;
-    int *edge = is_left_turn ? left_edge : right_edge;
-
-    for (int i = MT9V03X_1_H - 2; i >= 1; i--)
-    {
-        if (edge[i] < 0 || edge[i + 1] < 0) continue;
-        int jump = edge[i] - edge[i + 1];
-        if (jump < 0) jump = -jump;
-        if (jump > max_jump)
-        {
-            max_jump = jump;
-            corner_row = i;
-        }
-    }
-
-    /* 如果跳变不够明显，回退到丢线起始行 */
-    if (max_jump < SHARP_TURN_CORNER_DERIV)
-    {
-        corner_row = is_left_turn ? left_lost_row : right_lost_row;
-        if (corner_row < 0) corner_row = MT9V03X_1_H - 1;
-    }
-
-    /*
-     * 步骤 4：生成斜线中线
-     *   从底部中心画到弯角所在点，以此作为转弯期间的参考中线，
-     *   代替实际丢失的赛道边界。
-     */
-    int start_x  = (int)process_line_mid[MT9V03X_1_H - 1];
-    int start_y  = MT9V03X_1_H - 1;
-    int end_y    = corner_row;
-    int end_x    = is_left_turn ? SHARP_TURN_EDGE_MARGIN
-                                : MT9V03X_1_W - 1 - SHARP_TURN_EDGE_MARGIN;
-
-    // 提前探测
-    end_y -= 20;
-    if (end_y < 0) end_y = 0;
-    if (end_y > start_y) end_y = start_y;
-
-    /* 步骤 5：用 DDA 光栅化直线，写入 process_line_mid[] */
-    int dx = end_x - start_x;
-    int dy = end_y - start_y;
-    int steps = (abs(dy) > abs(dx)) ? abs(dy) : abs(dx);
-    if (steps < 1) steps = 1;
-
-    float x_inc = (float)dx / (float)steps;
-    float y_inc = (float)dy / (float)steps;
-    float x = (float)start_x;
-    float y = (float)start_y;
-
-    for (int s = 0; s <= steps; s++)
-    {
-        int row = (int)(y + 0.5f);
-        int col = (int)(x + 0.5f);
-        if (row >= 0 && row < MT9V03X_1_H && col >= 0 && col < MT9V03X_1_W)
-        {
-            process_line_mid[row] = (int16)col;
-        }
-        x += x_inc;
-        y += y_inc;
-    }
-
-    // 斜线上方行统一指向终点，消除黑色区域残留红线
-    for (int row = 0; row < end_y; row++)
-    {
-        process_line_mid[row] = (int16)end_x;
-    }
-
-    /* 保存调试用数据，供 image_display_task 画线 */
-    turn_dbg_active  = 1;
-    turn_dbg_start_x = start_x;
-    turn_dbg_start_y = start_y;
-    turn_dbg_end_x   = end_x;
-    turn_dbg_end_y   = end_y;
-    turn_dbg_is_left = is_left_turn;
-}
 
 /* =============== 十字路口与T字路口检测 =============== */
 
@@ -248,174 +127,331 @@ static void detect_boundary_sharp_turn(int left_edge[], int right_edge[])
  *   底+顶丢失、左右正常 = T字路口 → 底部中线垂直向上直行。
  *   底+左/右丢失已由直角弯检测处理。
  */
-static void detect_cross_t_junction(int left_edge[], int right_edge[])
+static int clamp_route_aim_row(int aim_row, int start_y)
+{
+    aim_row -= ROUTE_AIM_ADVANCE_ROWS;
+    if(aim_row < 0) aim_row = 0;
+    if(aim_row > start_y) aim_row = start_y;
+    return aim_row;
+}
+
+static int find_boundary_corner_row(route_decision_t decision,
+                                    int left_edge[],
+                                    int right_edge[],
+                                    int fallback_row)
+{
+    int corner_row = fallback_row;
+    int max_jump = 0;
+    int *edge = (decision == DECISION_LEFT) ? left_edge : right_edge;
+
+    for(int i = MT9V03X_1_H - 2; i >= 1; i--)
+    {
+        if(edge[i] < 0 || edge[i + 1] < 0) continue;
+        int jump = edge[i] - edge[i + 1];
+        if(jump < 0) jump = -jump;
+        if(jump > max_jump)
+        {
+            max_jump = jump;
+            corner_row = i;
+        }
+    }
+
+    if(max_jump < SHARP_TURN_CORNER_DERIV || corner_row < 0)
+    {
+        corner_row = fallback_row;
+    }
+    if(corner_row < 0)
+    {
+        corner_row = EXIT_ROI_TOP;
+    }
+    return corner_row;
+}
+
+static void draw_route_line(route_decision_t decision,
+                            junction_kind_t kind,
+                            int left_edge[],
+                            int right_edge[],
+                            int left_exit_row,
+                            int right_exit_row,
+                            int entry_center,
+                            int row_start,
+                            int row_end)
 {
     int h = MT9V03X_1_H;
     int w = MT9V03X_1_W;
-    int margin = 3;
-    int i;
+    int margin = SHARP_TURN_EDGE_MARGIN;
+    int start_x = (int)process_line_mid[h - 1];
+    int start_y = h - 1;
+    int aim_row = EXIT_ROI_TOP;
+    int end_y;
+    int end_x = w / 2;
 
-    static uint8 tjun_active = 0;  /* 同一T字路口不重复查询方向 */
-    static int8  tjun_saved_dir = 0;
+    if(start_x < 0 || start_x >= w) start_x = w / 2;
+    if(entry_center < 0 || entry_center >= w) entry_center = start_x;
+    if(row_start < 0) row_start = 0;
+    if(row_end > h) row_end = h;
+    if(row_end < row_start) row_end = row_start;
 
-    /* ---- 统计四边缘丢失像素数 ---- */
-    int b_lost = 0;  /* 底边：最下面 8 行左右边界均触边 */
-    for (i = h - 1; i >= h - 8 && i >= 0; i--)
+    if(decision == DECISION_STRAIGHT)
     {
-        if (left_edge[i] >= 0 && left_edge[i] <= margin &&
-            right_edge[i] >= 0 && right_edge[i] >= w - 1 - margin)
-            b_lost++;
-    }
-
-    int t_lost = 0;  /* 顶边：最上面 8 行左右边界均丢失或触边 */
-    for (i = 0; i < 8 && i < h; i++)
-    {
-        if (left_edge[i] < 0 || right_edge[i] < 0)
-            t_lost++;
-        else if (left_edge[i] <= margin && right_edge[i] >= w - 1 - margin)
-            t_lost++;
-    }
-
-    int l_lost = 0;  /* 左边：中间段左边界触左边缘 */
-    for (i = h / 4; i < h * 3 / 4; i++)
-    {
-        if (left_edge[i] >= 0 && left_edge[i] <= margin)
-            l_lost++;
-    }
-
-    int r_lost = 0;  /* 右边：中间段右边界触右边缘 */
-    for (i = h / 4; i < h * 3 / 4; i++)
-    {
-        if (right_edge[i] >= 0 && right_edge[i] >= w - 1 - margin)
-            r_lost++;
-    }
-
-    int b_flag = (b_lost >= 4);          /* 底边丢失 */
-    int t_flag = (t_lost >= 4);          /* 顶边丢失 */
-    int l_flag = (l_lost >= h / 8);      /* 左边丢失 */
-    int r_flag = (r_lost >= h / 8);      /* 右边丢失 */
-
-    /* 十字路口：四边全丢 */
-    if (b_flag && t_flag && l_flag && r_flag)
-    {
-        junction_type_from_camera = 2;
-
-        /* 取底部有效中线的 x 坐标，垂直向上画线穿过路口 */
-        int16 cx = process_line_mid[h - 1];
-        if (cx < 0 || cx >= w) cx = w / 2;
-
-        for (i = 0; i < h; i++)
+        for(int i = row_start; i < row_end; i++)
         {
-            process_line_mid[i] = cx;
+            process_line_mid[i] = (int16)entry_center;
         }
+        turn_dbg_active = 0;
         return;
     }
 
-    /* T字路口：底+顶丢失，左右均可见 */
-    if (b_flag && t_flag && !l_flag && !r_flag)
+    end_x = (decision == DECISION_LEFT) ? margin : (w - 1 - margin);
+    if(kind == JUNCTION_LEFT_CORNER || kind == JUNCTION_RIGHT_CORNER)
     {
-        if (!tjun_active)
-        {
-            tjun_active = 1;
-            tjun_saved_dir = Task2_GetTJunTurnDir(); /* 查表获取本次转弯方向 */
-        }
-
-        if (tjun_saved_dir == TURN_LEFT)
-        {
-            /* 左转 → 标记为急转弯，画斜线到左边缘 */
-            junction_type_from_camera = 3;
-
-            int start_x = (int)process_line_mid[h - 1];
-            int start_y = h - 1;
-            int end_y   = h / 3;
-            int end_x   = margin;
-
-            end_y -= 10;
-            if (end_y < 0) end_y = 0;
-            if (end_y > start_y) end_y = start_y;
-
-            int dx = end_x - start_x;
-            int dy = end_y - start_y;
-            int steps = (abs(dy) > abs(dx)) ? abs(dy) : abs(dx);
-            if (steps < 1) steps = 1;
-            float x_inc = (float)dx / (float)steps;
-            float y_inc = (float)dy / (float)steps;
-            float x = (float)start_x;
-            float y = (float)start_y;
-            for (int s = 0; s <= steps; s++)
-            {
-                int row = (int)(y + 0.5f);
-                int col = (int)(x + 0.5f);
-                if (row >= 0 && row < h && col >= 0 && col < w)
-                    process_line_mid[row] = (int16)col;
-                x += x_inc;
-                y += y_inc;
-            }
-            for (int r = 0; r < end_y; r++)
-                process_line_mid[r] = (int16)end_x;
-        }
-        else if (tjun_saved_dir == TURN_RIGHT)
-        {
-            /* 右转 → 标记为急转弯，画斜线到右边缘 */
-            junction_type_from_camera = 3;
-
-            int start_x = (int)process_line_mid[h - 1];
-            int start_y = h - 1;
-            int end_y   = h / 3;
-            int end_x   = w - 1 - margin;
-
-            end_y -= 10;
-            if (end_y < 0) end_y = 0;
-            if (end_y > start_y) end_y = start_y;
-
-            int dx = end_x - start_x;
-            int dy = end_y - start_y;
-            int steps = (abs(dy) > abs(dx)) ? abs(dy) : abs(dx);
-            if (steps < 1) steps = 1;
-            float x_inc = (float)dx / (float)steps;
-            float y_inc = (float)dy / (float)steps;
-            float x = (float)start_x;
-            float y = (float)start_y;
-            for (int s = 0; s <= steps; s++)
-            {
-                int row = (int)(y + 0.5f);
-                int col = (int)(x + 0.5f);
-                if (row >= 0 && row < h && col >= 0 && col < w)
-                    process_line_mid[row] = (int16)col;
-                x += x_inc;
-                y += y_inc;
-            }
-            for (int r = 0; r < end_y; r++)
-                process_line_mid[r] = (int16)end_x;
-        }
-        else
-        {
-            /* 直行 */
-            junction_type_from_camera = 1;
-
-            int16 cx = process_line_mid[h - 1];
-            if (cx < 0 || cx >= w) cx = w / 2;
-            for (i = 0; i < h; i++)
-                process_line_mid[i] = cx;
-        }
-        return;
+        int fallback_row = (decision == DECISION_LEFT) ? left_exit_row : right_exit_row;
+        aim_row = find_boundary_corner_row(decision, left_edge, right_edge, fallback_row);
     }
     else
     {
-        tjun_active = 0;  /* 离开T字路口，下次进入时重新查询方向 */
+        aim_row = (decision == DECISION_LEFT) ? left_exit_row : right_exit_row;
+        if(aim_row < 0) aim_row = EXIT_ROI_TOP;
+    }
+    end_y = clamp_route_aim_row(aim_row, start_y);
+
+    int dx = end_x - start_x;
+    int dy = end_y - start_y;
+    int steps = (abs(dy) > abs(dx)) ? abs(dy) : abs(dx);
+    if(steps < 1) steps = 1;
+
+    float x_inc = (float)dx / (float)steps;
+    float y_inc = (float)dy / (float)steps;
+    float x = (float)start_x;
+    float y = (float)start_y;
+
+    for(int s = 0; s <= steps; s++)
+    {
+        int row = (int)(y + 0.5f);
+        int col = (int)(x + 0.5f);
+        if(row >= 0 && row < h && col >= 0 && col < w)
+        {
+            process_line_mid[row] = (int16)col;
+        }
+        x += x_inc;
+        y += y_inc;
+    }
+    for(int row = 0; row < end_y; row++)
+    {
+        process_line_mid[row] = (int16)end_x;
     }
 
-    /* T字路口含侧向出口：底+顶+左 或 底+顶+右 → 交给直角弯检测 */
-    if (b_flag && t_flag && l_flag && !r_flag)
+    turn_dbg_active  = 1;
+    turn_dbg_start_x = start_x;
+    turn_dbg_start_y = start_y;
+    turn_dbg_end_x   = end_x;
+    turn_dbg_end_y   = end_y;
+    turn_dbg_is_left = (decision == DECISION_LEFT);
+}
+
+static uint8 decision_is_valid(junction_kind_t kind, route_decision_t decision)
+{
+    if(kind == JUNCTION_CROSS) return 1;
+    if(kind == JUNCTION_SIDE_LEFT_T)
     {
-        junction_type_from_camera = 3;
+        return (decision == DECISION_LEFT || decision == DECISION_STRAIGHT);
+    }
+    if(kind == JUNCTION_SIDE_RIGHT_T)
+    {
+        return (decision == DECISION_RIGHT || decision == DECISION_STRAIGHT);
+    }
+    if(kind == JUNCTION_STANDARD_T)
+    {
+        return (decision == DECISION_LEFT || decision == DECISION_RIGHT);
+    }
+    return 0;
+}
+
+static junction_kind_t classify_exits(uint8 front_exists, uint8 left_exists, uint8 right_exists)
+{
+    if(front_exists && left_exists && right_exists) return JUNCTION_CROSS;
+    if(front_exists && left_exists && !right_exists) return JUNCTION_SIDE_LEFT_T;
+    if(front_exists && !left_exists && right_exists) return JUNCTION_SIDE_RIGHT_T;
+    if(!front_exists && left_exists && right_exists) return JUNCTION_STANDARD_T;
+    if(!front_exists && left_exists && !right_exists) return JUNCTION_LEFT_CORNER;
+    if(!front_exists && !left_exists && right_exists) return JUNCTION_RIGHT_CORNER;
+    return JUNCTION_NONE;
+}
+
+static uint8 junction_needs_route_decision(junction_kind_t kind)
+{
+    return (kind == JUNCTION_CROSS ||
+            kind == JUNCTION_SIDE_LEFT_T ||
+            kind == JUNCTION_SIDE_RIGHT_T ||
+            kind == JUNCTION_STANDARD_T) ? 1 : 0;
+}
+
+static void detect_exits(int left_edge[], int right_edge[],
+                         uint8 *front_exists,
+                         uint8 *left_exists,
+                         uint8 *right_exists,
+                         int *left_exit_row,
+                         int *right_exit_row,
+                         int *entry_center_out,
+                         int *row_start_out,
+                         int *row_end_out)
+{
+    int h = MT9V03X_1_H;
+    int w = MT9V03X_1_W;
+    int row_start = EXIT_ROI_TOP;
+    int row_end = EXIT_ROI_BOTTOM;
+    int front_row_end = row_start + FRONT_TOP_ROWS;
+    int entry_row_start = row_end - FRONT_TOP_ROWS;
+    int entry_sum = 0;
+    int entry_count = 0;
+    int entry_center = w / 2;
+    int left_hits = 0;
+    int right_hits = 0;
+    int front_hits = 0;
+    int left_row_sum = 0;
+    int right_row_sum = 0;
+
+    if(front_row_end > row_end) front_row_end = row_end;
+    if(entry_row_start < row_start) entry_row_start = row_start;
+
+    for(int row = entry_row_start; row < row_end; row++)
+    {
+        int center = process_line_mid[row];
+        if(center >= 0 && center < w)
+        {
+            entry_sum += center;
+            entry_count++;
+        }
+    }
+    if(entry_count > 0)
+    {
+        entry_center = entry_sum / entry_count;
+    }
+
+    for(int row = row_start; row < row_end; row++)
+    {
+        if(left_edge[row] >= 0 && left_edge[row] <= EXIT_ROI_LEFT + EXIT_EDGE_MARGIN)
+        {
+            left_hits++;
+            left_row_sum += row;
+        }
+        if(right_edge[row] >= 0 && right_edge[row] >= EXIT_ROI_RIGHT - EXIT_EDGE_MARGIN)
+        {
+            right_hits++;
+            right_row_sum += row;
+        }
+    }
+
+    for(int row = row_start; row < front_row_end; row++)
+    {
+        int pixel_hits = 0;
+        int col_start = entry_center - FRONT_HALF_WIDTH;
+        int col_end = entry_center + FRONT_HALF_WIDTH;
+        if(col_start < 0) col_start = 0;
+        if(col_end >= w) col_end = w - 1;
+
+        for(int col = col_start; col <= col_end; col++)
+        {
+            if(process_image[row][col] != 0)
+            {
+                pixel_hits++;
+            }
+        }
+        if(pixel_hits >= FRONT_ROW_MIN_PIXELS)
+        {
+            front_hits++;
+        }
+    }
+
+    *front_exists = (front_hits >= FRONT_EXIT_MIN_ROWS) ? 1 : 0;
+    *left_exists = (left_hits >= EXIT_SIDE_MIN_ROWS) ? 1 : 0;
+    *right_exists = (right_hits >= EXIT_SIDE_MIN_ROWS) ? 1 : 0;
+    *left_exit_row = (left_hits > 0) ? (left_row_sum / left_hits) : -1;
+    *right_exit_row = (right_hits > 0) ? (right_row_sum / right_hits) : -1;
+    *entry_center_out = entry_center;
+    *row_start_out = row_start;
+    *row_end_out = row_end;
+}
+
+static void detect_cross_t_junction(int left_edge[], int right_edge[])
+{
+    static uint8 junction_locked = 0;
+    static uint8 junction_missing_frames = 0;
+    static route_decision_t locked_decision = DECISION_STRAIGHT;
+    static junction_kind_t locked_kind = JUNCTION_NONE;
+
+    uint8 front_exists = 0;
+    uint8 left_exists = 0;
+    uint8 right_exists = 0;
+    int left_exit_row = -1;
+    int right_exit_row = -1;
+    int entry_center = 0;
+    int row_start = 0;
+    int row_end = 0;
+    junction_kind_t detected_kind;
+
+    detect_exits(left_edge, right_edge, &front_exists, &left_exists, &right_exists,
+                 &left_exit_row, &right_exit_row, &entry_center, &row_start, &row_end);
+    detected_kind = classify_exits(front_exists, left_exists, right_exists);
+
+    if(detected_kind == JUNCTION_NONE)
+    {
+        current_junction_kind = JUNCTION_NONE;
+        if(junction_locked)
+        {
+            junction_missing_frames++;
+            if(junction_missing_frames >= JUNCTION_MISSING_UNLOCK_FRAMES)
+            {
+                junction_locked = 0;
+                locked_kind = JUNCTION_NONE;
+                locked_decision = DECISION_STRAIGHT;
+            }
+        }
         return;
     }
-    if (b_flag && t_flag && !l_flag && r_flag)
+
+    junction_missing_frames = 0;
+    if(!junction_locked)
     {
-        junction_type_from_camera = 3;
+        locked_kind = detected_kind;
+        if(junction_needs_route_decision(detected_kind)
+           && Control_GetTaskMode() == TASK_MODE_2)
+            locked_decision = Task2_GetRouteDecision();
+        else if(detected_kind == JUNCTION_LEFT_CORNER)
+            locked_decision = DECISION_LEFT;
+        else if(detected_kind == JUNCTION_RIGHT_CORNER)
+            locked_decision = DECISION_RIGHT;
+        else
+            locked_decision = DECISION_STRAIGHT;
+        junction_locked = 1;
+    }
+
+    current_junction_kind = locked_kind;
+    current_route_decision = locked_decision;
+    junction_error = junction_needs_route_decision(locked_kind) ?
+                     (decision_is_valid(locked_kind, locked_decision) ? 0 : 1) :
+                     0;
+    if(junction_error)
+    {
+        junction_type_from_camera = 0;
+        turn_dbg_active = 0;
         return;
     }
+
+    if(locked_kind == JUNCTION_LEFT_CORNER || locked_kind == JUNCTION_RIGHT_CORNER)
+    {
+        junction_type_from_camera = 3;
+    }
+    else if(locked_decision == DECISION_STRAIGHT)
+    {
+        junction_type_from_camera = (locked_kind == JUNCTION_CROSS) ? 2 : 1;
+    }
+    else
+    {
+        junction_type_from_camera = 3;
+    }
+    draw_route_line(locked_decision, locked_kind, left_edge, right_edge,
+                    left_exit_row, right_exit_row, entry_center, row_start, row_end);
 }
 
 /* =============== Otsu 大津法自适应二值化 =============== */
@@ -656,14 +692,9 @@ void image_process_task(void)
             }
         }
 
-        /* 步骤 4：检测直角弯（复用搜线阶段的左右边界，过滤赛道外噪声 */
-        detect_boundary_sharp_turn(boundary_left, boundary_right);
-
-        /* 步骤 4.5：检测十字路口与T字路口（参考草莽四边缘丢失法） */
-        if (junction_type_from_camera == 0)
-        {
-            detect_cross_t_junction(boundary_left, boundary_right);
-        }
+        /* Step 4: classify cross, T-junctions, and corners from exit flags. */
+        junction_type_from_camera = 0;
+        detect_cross_t_junction(boundary_left, boundary_right);
 
         line_lost_count = (lost_line_count > 255) ? 255 : (uint8)lost_line_count;
 
@@ -743,9 +774,48 @@ void image_display_task(void)
     ips200_show_int(126, 122, (int32)(gyro[0] * 57.3f), 4);
 
     ips200_show_string(0, 140, "T:");
-    ips200_show_int(18, 140, Task1_GetCount(), 2);
-    ips200_show_string(36, 140, "/");
-    ips200_show_int(42, 140, TASK1_TURN_TARGET, 2);
+    if(Control_GetTaskMode() == TASK_MODE_2)
+    {
+        ips200_show_int(18, 140, Task2_GetCount(), 2);
+        ips200_show_string(36, 140, "/");
+        ips200_show_int(42, 140, TASK2_TURN_TARGET, 2);
+    }
+    else
+    {
+        ips200_show_int(18, 140, Task1_GetCount(), 2);
+        ips200_show_string(36, 140, "/");
+        ips200_show_int(42, 140, TASK1_TURN_TARGET, 2);
+    }
+
+    // 路口类型与决策显示（始终显示，不只错误时才显示）
+    if(junction_error) ips200_show_string(72, 140, "ERR");
+    else               ips200_show_string(72, 140, "   ");
+
+    if(current_junction_kind == JUNCTION_CROSS)
+        ips200_show_string(96, 140, "CRS");
+    else if(current_junction_kind == JUNCTION_SIDE_LEFT_T)
+        ips200_show_string(96, 140, "SLT");
+    else if(current_junction_kind == JUNCTION_SIDE_RIGHT_T)
+        ips200_show_string(96, 140, "SRT");
+    else if(current_junction_kind == JUNCTION_STANDARD_T)
+        ips200_show_string(96, 140, "STD");
+    else if(current_junction_kind == JUNCTION_LEFT_CORNER)
+        ips200_show_string(96, 140, "L90");
+    else if(current_junction_kind == JUNCTION_RIGHT_CORNER)
+        ips200_show_string(96, 140, "R90");
+    else
+        ips200_show_string(96, 140, "   ");
+
+    if(current_route_decision == DECISION_LEFT)
+        ips200_show_string(120, 140, "L");
+    else if(current_route_decision == DECISION_RIGHT)
+        ips200_show_string(120, 140, "R");
+    else if(current_route_decision == DECISION_STRAIGHT)
+        ips200_show_string(120, 140, "S");
+    else
+        ips200_show_string(120, 140, " ");
+    }
+
 
 #if ENABLE_TURN_DEBUG
     /* 直角弯诊断叠加层 */
@@ -796,4 +866,20 @@ int16 Camera_GetCenterLine(uint8 row)
         return MT9V03X_1_W / 2;
     }
     return line_mid[row];
+}
+
+
+uint8 Camera_GetJunctionError(void)
+{
+    return junction_error;
+}
+
+junction_kind_t Camera_GetJunctionKind(void)
+{
+    return current_junction_kind;
+}
+
+route_decision_t Camera_GetRouteDecision(void)
+{
+    return current_route_decision;
 }

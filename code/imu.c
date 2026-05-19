@@ -30,7 +30,6 @@ float imu_yaw = 0.0f;
 float gyro[3] = {0.0f, 0.0f, 0.0f};
 float accel[3] = {0.0f, 0.0f, 0.0f};
 float gyro_correct[3] = {0.0f, 0.0f, 0.0f};
-float temp = 0.0f;
 
 uint8 anglesComputed = 0;
 uint8 attitude_flag = 0;

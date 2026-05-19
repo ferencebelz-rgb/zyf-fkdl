@@ -228,10 +228,18 @@ static void update_targets_from_camera(void)
     if(turn_limit > base_speed_target) turn_limit = base_speed_target;
     turn_output = clamp_i16((int32)turn, -turn_limit, turn_limit);
 
-    // Boost turn on confirmed sharp right-angle turn
-    if (turn_active)
+    // 直角弯转向加力平滑过渡：进弯逐帧递增，出弯逐帧递减
     {
-        turn_output = (int16)(turn_output * 5);
+        static float boost = 1.0f;
+        if (turn_active)
+        {
+            if (boost < 5.0f) boost += 1.0f;  /* 5帧到5倍 */
+        }
+        else
+        {
+            if (boost > 1.0f) boost -= 1.0f;  /* 5帧退回1倍 */
+        }
+        turn_output = (int16)(turn_output * boost);
         turn_output = clamp_i16((int32)turn_output, -turn_limit, turn_limit);
     }
 #endif
@@ -258,6 +266,10 @@ void Control_Task10ms(void)
     Motor_ReadEncoder10ms(&speed_l, &speed_r);
 
     if((abs(speed_l) > ENCODER_SPEED_STOP_LIMIT) || (abs(speed_r) > ENCODER_SPEED_STOP_LIMIT))
+    {
+        fault_stop = 1;
+    }
+    if(Camera_GetJunctionError())
     {
         fault_stop = 1;
     }
