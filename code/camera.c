@@ -157,15 +157,20 @@ static void detect_boundary_sharp_turn(int left_edge[], int right_edge[])
 
     /*
      * 步骤 3：角点定位
-     *   边界跳动最大的行就是弯角所在行。从底部往上扫描，
-     *   计算每行边界位置的变化率（导数），取最大跳变点。
-     *   比直接用丢线行更精确。
+     *   在丢线行上下 ±15 行的窗口内搜索边界跳动最大的行，
+     *   避免顶端曝光等干扰产生假角点。
      */
-    int corner_row = MT9V03X_1_H - 1;
+    int lost_row = is_left_turn ? left_lost_row : right_lost_row;
+    int scan_top    = lost_row - 15;
+    int scan_bottom = lost_row + 15;
+    if (scan_top < 1) scan_top = 1;
+    if (scan_bottom >= MT9V03X_1_H - 1) scan_bottom = MT9V03X_1_H - 1;
+
+    int corner_row = scan_bottom;
     int max_jump   = 0;
     int *edge = is_left_turn ? left_edge : right_edge;
 
-    for (int i = MT9V03X_1_H - 2; i >= 1; i--)
+    for (int i = scan_bottom - 1; i >= scan_top; i--)
     {
         if (edge[i] < 0 || edge[i + 1] < 0) continue;
         int jump = edge[i] - edge[i + 1];
@@ -192,8 +197,8 @@ static void detect_boundary_sharp_turn(int left_edge[], int right_edge[])
     int start_x  = (int)process_line_mid[MT9V03X_1_H - 1];
     int start_y  = MT9V03X_1_H - 1;
     int end_y    = corner_row;
-    int end_x    = is_left_turn ? SHARP_TURN_EDGE_MARGIN
-                                : MT9V03X_1_W - 1 - SHARP_TURN_EDGE_MARGIN;
+    int end_x    = is_left_turn ? 0
+                                : MT9V03X_1_W - 1;
 
     // 提前探测
     end_y -= 20;
@@ -367,10 +372,21 @@ void image_process_task(void)
         int lost_line_count = 0;  /* 本轮连续丢线的行数统计 */
         int boundary_left[MT9V03X_1_H];   /* 每行赛道左边界，供直角弯检测复用 */
         int boundary_right[MT9V03X_1_H];  /* 每行赛道右边界，供直角弯检测复用 */
+        int consecutive_lost = 0;          /* 连续丢线行计数 */
+        int scan_stopped_row = -1;         /* 连续丢线超过阈值后停止搜线的行号 */
 
         /* 步骤 3：逐行扫描中线（从近处往远处扫 */
         for (int i = MT9V03X_1_H - 1; i >= 0; i--)
         {
+            /* 连续丢线超过 15 行，停止搜线，上方全部标记丢线 */
+            if (scan_stopped_row >= 0)
+            {
+                boundary_left[i]  = -1;
+                boundary_right[i] = -1;
+                process_line_mid[i] = process_line_mid[i + 1];
+                lost_line_count++;
+                continue;
+            }
             /* 从上一行中线位置出发搜索，提高速度并抑制噪声 */
             int center_seed = (i == MT9V03X_1_H - 1) ? (MT9V03X_1_W / 2) : process_line_mid[i + 1];
             if (center_seed < 0) center_seed = 0;
@@ -405,10 +421,13 @@ void image_process_task(void)
                 boundary_right[i] = -1;
                 process_line_mid[i] = center_seed;
                 lost_line_count++;
+                consecutive_lost++;
+                if (consecutive_lost >= 15) scan_stopped_row = i;
                 continue;
             }
 
             /* 找到赛道后，向左右扩展找到完整边界 */
+            consecutive_lost = 0;
             left = line_pos;
             right = line_pos;
             while ((left > 0) && (process_image[i][left] != 0)) left--;

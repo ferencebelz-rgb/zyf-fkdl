@@ -20,7 +20,7 @@
 
 // Sharp (right-angle) turn detection via edge-boundary tracking
 
-#define SHARP_TURN_EDGE_MARGIN     3
+#define SHARP_TURN_EDGE_MARGIN     15
 
 #define SHARP_TURN_LOST_MIN        6
 
