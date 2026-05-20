@@ -3,6 +3,8 @@
 static uint8  turn_count = 0;
 static uint16 stop_delay = 0;
 
+/* Route decisions are consumed only for the six junctions; the other two
+ * counted turns are normal right-angle turns handled directly by camera.c. */
 static const route_decision_t route_sequence[] =
 {
     DECISION_RIGHT,

@@ -312,10 +312,9 @@ void Control_Task10ms(void)
 
     Motor_SetPWM(pwm_l, pwm_r);
 
-    Task1_Update();
-    Task2_Update();
     if (active_mode == TASK_MODE_1)
     {
+        Task1_Update();
         if (Task1_IsFinished())
         {
             base_speed_cmd = 0;
@@ -324,6 +323,7 @@ void Control_Task10ms(void)
     }
     else
     {
+        Task2_Update();
         if (Task2_IsFinished())
         {
             base_speed_cmd = 0;

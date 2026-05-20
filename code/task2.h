@@ -3,7 +3,7 @@
 
 #include "zf_common_headfile.h"
 
-#define TASK2_TURN_TARGET  8
+#define TASK2_TURN_TARGET  8  /* 6 route junctions + 2 normal right-angle turns */
 
 typedef enum
 {

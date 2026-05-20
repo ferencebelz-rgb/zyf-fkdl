@@ -608,6 +608,9 @@ static void detect_cross_t_junction(int left_edge[], int right_edge[])
     if(detected_kind == JUNCTION_NONE)
     {
         current_junction_kind = JUNCTION_NONE;
+        current_route_decision = DECISION_STRAIGHT;
+        junction_error = 0;
+        turn_dbg_active = 0;
         if(junction_locked)
         {
             junction_missing_frames++;
