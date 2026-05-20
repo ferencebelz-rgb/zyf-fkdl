@@ -4,7 +4,6 @@
 #include "motor.h"
 #include "pid.h"
 #include "task1.h"
-#include "task2.h"
 #include "zf_device_ips200.h"
 #include <stdlib.h>
 
@@ -27,7 +26,6 @@ static float turn_kd = CONTROL_TURN_KD_DEFAULT;
 
 static uint8 fault_stop = 0;
 static uint16 start_ticks = 0;  /* 起步计时 (10ms/tick) */
-static task_mode_t active_mode = TASK_MODE_1;
 
 static uint16 stall_count_l = 0;
 static uint16 stall_count_r = 0;
@@ -64,8 +62,6 @@ void Control_Init(void)
     IncrementalPI_Init(&speed_pid_r, speed_kp, speed_ki);
     PositionPD_Init(&turn_pid, turn_kp, turn_kd);
     Task1_Init();
-    Task2_Init();
-    active_mode = TASK_MODE_1;
     start_ticks = 0;
     control_reset_runtime();
 }
@@ -207,11 +203,7 @@ static void update_targets_from_camera(void)
         if (dyaw >= 60.0f)
         {
             turn_active = 0;
-            /* 根据当前模式路由到对应任务 */
-            if (active_mode == TASK_MODE_1)
-                Task1_CountTurn();
-            else
-                Task2_CountTurn();
+            Task1_CountTurn();  /* IMU 确认转弯完成，计一次 */
         }
     }
 
@@ -228,18 +220,10 @@ static void update_targets_from_camera(void)
     if(turn_limit > base_speed_target) turn_limit = base_speed_target;
     turn_output = clamp_i16((int32)turn, -turn_limit, turn_limit);
 
-    // 直角弯转向加力平滑过渡：进弯逐帧递增，出弯逐帧递减
+    // Boost turn on confirmed sharp right-angle turn
+    if (turn_active)
     {
-        static float boost = 1.0f;
-        if (turn_active)
-        {
-            if (boost < 5.0f) boost += 1.0f;  /* 5帧到5倍 */
-        }
-        else
-        {
-            if (boost > 1.0f) boost -= 1.0f;  /* 5帧退回1倍 */
-        }
-        turn_output = (int16)(turn_output * boost);
+        turn_output = (int16)(turn_output * 5);
         turn_output = clamp_i16((int32)turn_output, -turn_limit, turn_limit);
     }
 #endif
@@ -266,10 +250,6 @@ void Control_Task10ms(void)
     Motor_ReadEncoder10ms(&speed_l, &speed_r);
 
     if((abs(speed_l) > ENCODER_SPEED_STOP_LIMIT) || (abs(speed_r) > ENCODER_SPEED_STOP_LIMIT))
-    {
-        fault_stop = 1;
-    }
-    if(Camera_GetJunctionError())
     {
         fault_stop = 1;
     }
@@ -312,23 +292,11 @@ void Control_Task10ms(void)
 
     Motor_SetPWM(pwm_l, pwm_r);
 
-    if (active_mode == TASK_MODE_1)
+    Task1_Update();
+    if (Task1_IsFinished())
     {
-        Task1_Update();
-        if (Task1_IsFinished())
-        {
-            base_speed_cmd = 0;
-            control_reset_runtime();
-        }
-    }
-    else
-    {
-        Task2_Update();
-        if (Task2_IsFinished())
-        {
-            base_speed_cmd = 0;
-            control_reset_runtime();
-        }
+        base_speed_cmd = 0;
+        control_reset_runtime();
     }
 }
 
@@ -342,18 +310,3 @@ int16 Control_GetTargetL(void) { return target_l; }
 int16 Control_GetTargetR(void) { return target_r; }
 int16 Control_GetTurnOutput(void) { return turn_output; }
 uint8 Control_GetFaultStop(void) { return fault_stop; }
-
-void Control_SetTaskMode(task_mode_t mode)
-{
-    if (mode == active_mode) return;
-    active_mode = mode;
-    if (mode == TASK_MODE_1)
-        Task1_Init();
-    else
-        Task2_Init();
-}
-
-task_mode_t Control_GetTaskMode(void)
-{
-    return active_mode;
-}

@@ -2,7 +2,6 @@
 #pragma section all "cpu0_dsram"
 
 #include "camera.h"
-#include "control.h"
 #include "fan.h"
 #include "imu.h"
 #include "motor.h"
@@ -31,8 +30,7 @@ int core0_main(void)
 
     cpu_wait_event_ready();
 
-    // KEY1=启动任务1  KEY2=启动任务2  KEY4=切换风扇
-    task_mode_t selected_mode = TASK_MODE_1;
+    // 等待 KEY1 启动任务 / KEY4 切换负压风扇
     while(TRUE)
     {
         key_scanner();
@@ -40,14 +38,7 @@ int core0_main(void)
         if(key_get_state(KEY_1) == KEY_SHORT_PRESS)
         {
             key_clear_state(KEY_1);
-            selected_mode = TASK_MODE_1;
-            break;
-        }
-        if(key_get_state(KEY_2) == KEY_SHORT_PRESS)
-        {
-            key_clear_state(KEY_2);
-            selected_mode = TASK_MODE_2;
-            break;
+            break;  // 启动任务1
         }
 
         if(key_get_state(KEY_4) == KEY_SHORT_PRESS)
@@ -63,7 +54,6 @@ int core0_main(void)
     }
 
     motor_init();
-    Control_SetTaskMode(selected_mode);
 
 #if (MOTOR_TEST_MODE == 1)
     motor_encoder_test_task();
@@ -81,13 +71,6 @@ int core0_main(void)
             key_clear_state(KEY_4);
             fan_on = !fan_on;
             fan_set_duty(fan_on ? 40 : 0);
-        }
-
-        // KEY3 运行中校准陀螺仪
-        if(key_get_state(KEY_3) == KEY_SHORT_PRESS)
-        {
-            key_clear_state(KEY_3);
-            imu_init();
         }
 
         image_process_task();
