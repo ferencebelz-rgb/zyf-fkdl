@@ -97,115 +97,82 @@ static void camera_copy_stable_frame(void)
     memcpy(raw_snapshot[0], mt9v03x_image_1[0], MT9V03X_1_W * MT9V03X_1_H);
 }
 
-/* =============== 直角转弯检测（边界跟踪法） =============== */
-
+/* =============== 中心框边缘检测转弯 + T字/十字路口 =============== */
 /*
  * 原理：
- *   从左下往右上逐行扫描，分别跟踪左右边界。
- *   当某侧边界触及图像边缘（丢失），而另一侧边界依然可见时，判定为直角弯。
- *   然后用"角点定位"找到边界跳动最大的行，从该行到底部中心画一条斜线作为新中线。
- *   参考实现来自草莽。
+ *   扫描中心框四条边，根据白线出现的边组合分类：
+ *     下+左         → 左直角弯   (type 3)
+ *     下+右         → 右直角弯   (type 3)
+ *     下+左+上       → 左T字路口  (type 1)
+ *     下+右+上       → 右T字路口  (type 1)
+ *     下+左+右       → 正T字路口  (type 1)
+ *     下+左+右+上    → 十字路口   (type 2)
+ *   只判断有无，不关心数量。
  */
-static void detect_boundary_sharp_turn(int left_edge[], int right_edge[])
+static void detect_box_edge_turn(int left_edge[], int right_edge[])
 {
-    int left_lost_row = -1;        /* 左侧丢线的起始行，-1 表示未丢 */
-    int right_lost_row = -1;       /* 右侧丢线的起始行 */
-    int left_visible  = 0;         /* 左侧可见的行数统计 */
-    int right_visible = 0;         /* 右侧可见的行数统计 */
+    uint16 box_w = MT9V03X_1_W / 2;
+    uint16 box_h = MT9V03X_1_H / 2;
+    uint16 x0 = (MT9V03X_1_W - box_w) / 2 - 24;
+    uint16 y0 = (MT9V03X_1_H - box_h) / 2;
+    uint16 x1 = x0 + box_w + 48;
+    uint16 y1 = y0 + box_h;
 
-    /* 步骤 1：使用搜线阶段提取的左右边界（已过滤赛道外噪声） */
-    for (int i = 0; i < MT9V03X_1_H; i++)
+    uint8 top_hit = 0, bottom_hit = 0, left_hit = 0, right_hit = 0;
+
+    for (uint16 x = x0; x <= x1 && !top_hit; x++)
+        if (process_image[y0][x] != 0) top_hit = 1;
+    for (uint16 x = x0; x <= x1 && !bottom_hit; x++)
+        if (process_image[y1][x] != 0) bottom_hit = 1;
+    for (uint16 y = y0 + 1; y < y1 && !left_hit; y++)
+        if (process_image[y][x0] != 0) left_hit = 1;
+    for (uint16 y = y0 + 1; y < y1 && !right_hit; y++)
+        if (process_image[y][x1] != 0) right_hit = 1;
+
+    if (!bottom_hit)
     {
-        int l = left_edge[i];
-        int r = right_edge[i];
-
-        /* 左边界触及图像左边缘 — 判定左侧丢线 */
-        if (l >= 0 && l <= SHARP_TURN_EDGE_MARGIN)
-        {
-            if (left_lost_row < 0) left_lost_row = i;
-        }
-        else if (l > SHARP_TURN_EDGE_MARGIN)
-        {
-            left_visible++;  /* 左边界正常可见 */
-        }
-
-        /* 右边界触及图像右边缘 — 判定右侧丢线 */
-        if (r >= 0 && r >= MT9V03X_1_W - 1 - SHARP_TURN_EDGE_MARGIN)
-        {
-            if (right_lost_row < 0) right_lost_row = i;
-        }
-        else if (r >= 0 && r < MT9V03X_1_W - 1 - SHARP_TURN_EDGE_MARGIN)
-        {
-            right_visible++;
-        }
-    }
-
-    /* 步骤 2：判断是否为直角弯（一侧丢线且另一侧可见行数足够多 */
-    int is_left_turn  = (left_lost_row >= 0)  && (left_lost_row > MT9V03X_1_H / 2)
-                        && (right_visible > MT9V03X_1_H / 4);
-    int is_right_turn = (right_lost_row >= 0) && (right_lost_row > MT9V03X_1_H / 2)
-                        && (left_visible > MT9V03X_1_H / 4);
-
-    if (!is_left_turn && !is_right_turn)
-    {
-        junction_type_from_camera = 0;  /* 未检测到直角弯，清零 */
+        junction_type_from_camera = 0;
         turn_dbg_active = 0;
         return;
     }
 
-    junction_type_from_camera = 3;  /* 标记为急转弯 */
+    /* 分类 */
+    int is_cross   = bottom_hit && left_hit && right_hit && top_hit;
+    int is_t_left  = bottom_hit && left_hit  && top_hit && !right_hit;
+    int is_t_right = bottom_hit && right_hit && top_hit && !left_hit;
+    int is_t_both  = bottom_hit && left_hit  && right_hit && !top_hit;
+    int is_left    = bottom_hit && left_hit  && !right_hit && !top_hit;
+    int is_right   = bottom_hit && right_hit && !left_hit  && !top_hit;
 
-    /*
-     * 步骤 3：角点定位
-     *   在丢线行上下 ±15 行的窗口内搜索边界跳动最大的行，
-     *   避免顶端曝光等干扰产生假角点。
-     */
-    int lost_row = is_left_turn ? left_lost_row : right_lost_row;
-    int scan_top    = lost_row - 15;
-    int scan_bottom = lost_row + 15;
-    if (scan_top < 1) scan_top = 1;
-    if (scan_bottom >= MT9V03X_1_H - 1) scan_bottom = MT9V03X_1_H - 1;
-
-    int corner_row = scan_bottom;
-    int max_jump   = 0;
-    int *edge = is_left_turn ? left_edge : right_edge;
-
-    for (int i = scan_bottom - 1; i >= scan_top; i--)
+    if (is_cross)
+        junction_type_from_camera = 2;
+    else if (is_t_left || is_t_right || is_t_both)
+        junction_type_from_camera = 1;
+    else if (is_left || is_right)
+        junction_type_from_camera = 3;
+    else
     {
-        if (edge[i] < 0 || edge[i + 1] < 0) continue;
-        int jump = edge[i] - edge[i + 1];
-        if (jump < 0) jump = -jump;
-        if (jump > max_jump)
-        {
-            max_jump = jump;
-            corner_row = i;
-        }
+        junction_type_from_camera = 0;
+        turn_dbg_active = 0;
+        return;
     }
 
-    /* 如果跳变不够明显，回退到丢线起始行 */
-    if (max_jump < SHARP_TURN_CORNER_DERIV)
+    /* 直角弯画斜线，T字/十字直行 */
+    if (!is_left && !is_right)
     {
-        corner_row = is_left_turn ? left_lost_row : right_lost_row;
-        if (corner_row < 0) corner_row = MT9V03X_1_H - 1;
+        turn_dbg_active = 0;
+        return;
     }
 
-    /*
-     * 步骤 4：生成斜线中线
-     *   从底部中心画到弯角所在点，以此作为转弯期间的参考中线，
-     *   代替实际丢失的赛道边界。
-     */
-    int start_x  = (int)process_line_mid[MT9V03X_1_H - 1];
-    int start_y  = MT9V03X_1_H - 1;
-    int end_y    = corner_row;
-    int end_x    = is_left_turn ? 0
-                                : MT9V03X_1_W - 1;
+    int start_x = (int)process_line_mid[MT9V03X_1_H - 1];
+    int start_y = MT9V03X_1_H - 1;
+    if (start_x < 0 || start_x >= MT9V03X_1_W) start_x = MT9V03X_1_W / 2;
 
-    // 提前探测
-    end_y -= 20;
+    int end_x = is_left ? 0 : (MT9V03X_1_W - 1);
+    int end_y = y1 - 20;
     if (end_y < 0) end_y = 0;
     if (end_y > start_y) end_y = start_y;
 
-    /* 步骤 5：用 DDA 光栅化直线，写入 process_line_mid[] */
     int dx = end_x - start_x;
     int dy = end_y - start_y;
     int steps = (abs(dy) > abs(dx)) ? abs(dy) : abs(dx);
@@ -221,26 +188,19 @@ static void detect_boundary_sharp_turn(int left_edge[], int right_edge[])
         int row = (int)(y + 0.5f);
         int col = (int)(x + 0.5f);
         if (row >= 0 && row < MT9V03X_1_H && col >= 0 && col < MT9V03X_1_W)
-        {
             process_line_mid[row] = (int16)col;
-        }
         x += x_inc;
         y += y_inc;
     }
-
-    // 斜线上方行统一指向终点，消除黑色区域残留红线
     for (int row = 0; row < end_y; row++)
-    {
         process_line_mid[row] = (int16)end_x;
-    }
 
-    /* 保存调试用数据，供 image_display_task 画线 */
     turn_dbg_active  = 1;
     turn_dbg_start_x = start_x;
     turn_dbg_start_y = start_y;
     turn_dbg_end_x   = end_x;
     turn_dbg_end_y   = end_y;
-    turn_dbg_is_left = is_left_turn;
+    turn_dbg_is_left = is_left;
 }
 
 /* =============== Otsu 大津法自适应二值化 =============== */
@@ -475,7 +435,7 @@ void image_process_task(void)
         }
 
         /* 步骤 4：检测直角弯（复用搜线阶段的左右边界，过滤赛道外噪声 */
-        detect_boundary_sharp_turn(boundary_left, boundary_right);
+        detect_box_edge_turn(boundary_left, boundary_right);
 
         line_lost_count = (lost_line_count > 255) ? 255 : (uint8)lost_line_count;
 
@@ -523,6 +483,68 @@ void image_display_task(void)
     /* 显示二值化后的摄像头图像 */
     ips200_show_gray_image(0, 0, display_image[0], MT9V03X_1_W, MT9V03X_1_H, MT9V03X_1_W, MT9V03X_1_H, 0);
 
+    /* 屏幕中心框 + 边缘白线标记 */
+    {
+        uint16 box_w = MT9V03X_1_W / 2;
+        uint16 box_h = MT9V03X_1_H / 2;
+        uint16 x0 = (MT9V03X_1_W - box_w) / 2 - 24;
+        uint16 y0 = (MT9V03X_1_H - box_h) / 2;
+        uint16 x1 = x0 + box_w + 48;
+        uint16 y1 = y0 + box_h;
+
+        /* 绿色框 */
+        ips200_draw_line(x0, y0, x1, y0, RGB565_GREEN);
+        ips200_draw_line(x1, y0, x1, y1, RGB565_GREEN);
+        ips200_draw_line(x1, y1, x0, y1, RGB565_GREEN);
+        ips200_draw_line(x0, y1, x0, y0, RGB565_GREEN);
+
+        /* 扫描四边，白线连续段画 5×6 蓝色空心标记 */
+        for (uint16 x = x0; x <= x1; )
+        {
+            if (display_image[y0][x] != 0)
+            {
+                uint16 bx = x; while (x <= x1 && display_image[y0][x] != 0) x++;
+                ips200_draw_line(bx, y0, bx+4, y0, RGB565_BLUE);
+                ips200_draw_line(bx+4, y0, bx+4, y0+5, RGB565_BLUE);
+                ips200_draw_line(bx+4, y0+5, bx, y0+5, RGB565_BLUE);
+                ips200_draw_line(bx, y0+5, bx, y0, RGB565_BLUE);
+            } else x++;
+        }
+        for (uint16 x = x0; x <= x1; )
+        {
+            if (display_image[y1][x] != 0)
+            {
+                uint16 bx = x; while (x <= x1 && display_image[y1][x] != 0) x++;
+                ips200_draw_line(bx, y1, bx+4, y1, RGB565_BLUE);
+                ips200_draw_line(bx+4, y1, bx+4, y1+5, RGB565_BLUE);
+                ips200_draw_line(bx+4, y1+5, bx, y1+5, RGB565_BLUE);
+                ips200_draw_line(bx, y1+5, bx, y1, RGB565_BLUE);
+            } else x++;
+        }
+        for (uint16 y = y0 + 1; y < y1; )
+        {
+            if (display_image[y][x0] != 0)
+            {
+                uint16 by = y; while (y < y1 && display_image[y][x0] != 0) y++;
+                ips200_draw_line(x0, by, x0+4, by, RGB565_BLUE);
+                ips200_draw_line(x0+4, by, x0+4, by+5, RGB565_BLUE);
+                ips200_draw_line(x0+4, by+5, x0, by+5, RGB565_BLUE);
+                ips200_draw_line(x0, by+5, x0, by, RGB565_BLUE);
+            } else y++;
+        }
+        for (uint16 y = y0 + 1; y < y1; )
+        {
+            if (display_image[y][x1] != 0)
+            {
+                uint16 by = y; while (y < y1 && display_image[y][x1] != 0) y++;
+                ips200_draw_line(x1, by, x1+4, by, RGB565_BLUE);
+                ips200_draw_line(x1+4, by, x1+4, by+5, RGB565_BLUE);
+                ips200_draw_line(x1+4, by+5, x1, by+5, RGB565_BLUE);
+                ips200_draw_line(x1, by+5, x1, by, RGB565_BLUE);
+            } else y++;
+        }
+    }
+
     /* 用红点画中线、蓝点画左边界、绿点画右边界 */
     for (int i = 0; i < MT9V03X_1_H; i++)
     {
@@ -553,6 +575,17 @@ void image_display_task(void)
     ips200_show_int(72, 122, (int32)(gyro[1] * 57.3f), 4);
     ips200_show_string(108, 122, "GX");
     ips200_show_int(126, 122, (int32)(gyro[0] * 57.3f), 4);
+
+    /* 路口类型 */
+    ips200_show_string(0, 130, "J:");
+    if (junction_type_from_camera == 2)
+        ips200_show_string(18, 130, "CRS");
+    else if (junction_type_from_camera == 1)
+        ips200_show_string(18, 130, "T");
+    else if (junction_type_from_camera == 3)
+        ips200_show_string(18, 130, turn_dbg_is_left ? "L90" : "R90");
+    else
+        ips200_show_string(18, 130, "---");
 
     ips200_show_string(0, 140, "T:");
     ips200_show_int(18, 140, Task1_GetCount(), 2);

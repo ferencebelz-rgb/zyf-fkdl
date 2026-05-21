@@ -200,7 +200,7 @@ static void update_targets_from_camera(void)
         float dyaw = imu_yaw - turn_entry_yaw;
         if (dyaw < 0) dyaw = -dyaw;
         if (dyaw > 180.0f) dyaw = 360.0f - dyaw;
-        if (dyaw >= 60.0f)
+        if (dyaw >= 68.0f)
         {
             turn_active = 0;
             Task1_CountTurn();  /* IMU 确认转弯完成，计一次 */
