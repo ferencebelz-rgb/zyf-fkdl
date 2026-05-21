@@ -172,12 +172,18 @@ static void update_targets_from_camera(void)
     float error;
     float turn;
 
-    // 进弯用3帧确认，出弯靠IMU偏航角变化超过60度判断
-    static uint8  turn_entry_cnt = 0;  // 连续检测帧数
-    static uint8  turn_active = 0;     // 是否处于直角弯状态
-    static float turn_entry_yaw = 0;   // 进弯时的偏航角
+    // 直角弯/T字路口进弯用3帧确认（junction_side>0），出弯靠IMU偏航角变化>=85°
+    static uint8  turn_entry_cnt  = 0;
+    static uint8  turn_active     = 0;
+    static float  turn_entry_yaw  = 0;
+    static uint8  turn_junc_type  = 0;  /* 进弯时的路口类型，出弯时用于区分计次 */
 
-    if (junction_type_from_camera >= 3)
+    /* 直行T字路口通过确认：需稳定看到→稳定消失后才推进序列 */
+    static uint8  straight_t_seen  = 0;  /* 连续看到直行T的帧数 */
+    static uint8  straight_t_gone  = 0;  /* 直行T消失后的连续帧数 */
+    static uint8  straight_t_state = 0;  /* 0=空闲 1=T字路口已确认，等待消失 */
+
+    if (junction_side != 0)
     {
         if (turn_entry_cnt < 255) turn_entry_cnt++;
     }
@@ -190,7 +196,8 @@ static void update_targets_from_camera(void)
     {
         if (turn_entry_cnt >= 3)
         {
-            turn_active = 1;
+            turn_active    = 1;
+            turn_junc_type = junction_type_from_camera;  /* 保存进弯类型 */
             turn_entry_yaw = imu_yaw;
         }
     }
@@ -200,11 +207,47 @@ static void update_targets_from_camera(void)
         float dyaw = imu_yaw - turn_entry_yaw;
         if (dyaw < 0) dyaw = -dyaw;
         if (dyaw > 180.0f) dyaw = 360.0f - dyaw;
-        if (dyaw >= 68.0f)
+        if (dyaw >= 85.0f)
         {
             turn_active = 0;
-            Task1_CountTurn();  /* IMU 确认转弯完成，计一次 */
+            if (turn_junc_type == 1)
+                Task1_TComplete();   /* T字路口转弯完成 */
+            else
+                Task1_CountTurn();   /* 直角弯完成 */
         }
+    }
+
+    /* 直行T字路口通过确认：稳定看到→稳定消失→推进序列 */
+    if (turn_active)
+    {
+        /* 正在转弯，清空直行T状态 */
+        straight_t_state = 0;
+        straight_t_seen  = 0;
+        straight_t_gone  = 0;
+    }
+    else if (junction_type_from_camera == 1 && junction_side == 0)
+    {
+        straight_t_seen++;
+        if (straight_t_seen > 250) straight_t_seen = 250;
+        straight_t_gone = 0;
+        if (straight_t_seen >= 5) straight_t_state = 1;
+    }
+    else if (straight_t_state == 1)
+    {
+        /* T字路口消失，等待连续消失帧确认通过 */
+        straight_t_gone++;
+        straight_t_seen = 0;
+        if (straight_t_gone >= 10)
+        {
+            Task1_TSkip();
+            straight_t_state = 0;
+            straight_t_gone = 0;
+        }
+    }
+    else
+    {
+        straight_t_seen  = 0;
+        straight_t_gone  = 0;
     }
 
     base_speed_target = approach_i16(base_speed_target, base_speed_cmd, CONTROL_BASE_RAMP_STEP);
@@ -220,7 +263,7 @@ static void update_targets_from_camera(void)
     if(turn_limit > base_speed_target) turn_limit = base_speed_target;
     turn_output = clamp_i16((int32)turn, -turn_limit, turn_limit);
 
-    // Boost turn on confirmed sharp right-angle turn
+    // 转弯/T字路口已确认，加大打角
     if (turn_active)
     {
         turn_output = (int16)(turn_output * 5);

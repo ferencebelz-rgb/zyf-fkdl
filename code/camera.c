@@ -36,7 +36,9 @@
 
 int16 line_mid[MT9V03X_1_H];         /* 各行的中线列坐标，供 control.c 前视用 */
 int16 track_offset = 0;              /* 赛道偏移量（像素），供 control.c 转向用 */
-uint8 junction_type_from_camera = 0; /* 0=直道 1=T/直角 2=十字/L 3=急转弯 */
+uint8 junction_type_from_camera = 0; /* 0=直道 1=T字路口 2=十字 3=直角弯 */
+uint8 junction_side = 0;           /* 0=无路口, 1=左转, 2=右转 */
+uint8 t_junction_seen = 0;         /* 当前帧检测到T字路口（含直行通过的 */
 static uint8 line_lost_count = 0;    /* 连续丢线行数统计 */
 
 /* =================== 双缓冲缓冲区定义 =================== */
@@ -103,10 +105,11 @@ static void camera_copy_stable_frame(void)
  *   扫描中心框四条边，根据白线出现的边组合分类：
  *     下+左         → 左直角弯   (type 3)
  *     下+右         → 右直角弯   (type 3)
- *     下+左+上       → 左T字路口  (type 1)
- *     下+右+上       → 右T字路口  (type 1)
- *     下+左+右       → 正T字路口  (type 1)
+ *     下+左+上       → 左T字路口  (type 1, 触发左转)
+ *     下+右+上       → 右T字路口  (type 1, 触发右转)
+ *     下+左+右       → 正T字路口  (type 1, 方向不确定不走线)
  *     下+左+右+上    → 十字路口   (type 2)
+ *   type 1 和 type 3 均触发转弯，type 2 直行。
  *   只判断有无，不关心数量。
  */
 static void detect_box_edge_turn(int left_edge[], int right_edge[])
@@ -132,6 +135,8 @@ static void detect_box_edge_turn(int left_edge[], int right_edge[])
     if (!bottom_hit)
     {
         junction_type_from_camera = 0;
+        junction_side = 0;
+        t_junction_seen = 0;
         turn_dbg_active = 0;
         return;
     }
@@ -143,21 +148,54 @@ static void detect_box_edge_turn(int left_edge[], int right_edge[])
     int is_t_both  = bottom_hit && left_hit  && right_hit && !top_hit;
     int is_left    = bottom_hit && left_hit  && !right_hit && !top_hit;
     int is_right   = bottom_hit && right_hit && !left_hit  && !top_hit;
+    int is_t_junc  = is_t_left || is_t_right || is_t_both;
+
+    t_junction_seen = is_t_junc ? 1 : 0;
 
     if (is_cross)
+    {
         junction_type_from_camera = 2;
-    else if (is_t_left || is_t_right || is_t_both)
+        junction_side = 0;
+    }
+    else if (is_t_junc)
+    {
+        /* T字路口：查序列决定方向 */
+        uint8 t_dir = Task1_GetNextTDir();
         junction_type_from_camera = 1;
+
+        if (t_dir == 2)  /* 直行 */
+        {
+            junction_side = 0;
+            is_left  = 0;
+            is_right = 0;
+        }
+        else if (t_dir == 0)  /* 强制右转 */
+        {
+            junction_side = 2;
+            is_left  = 0;
+            is_right = 1;
+        }
+        else  /* 强制左转 */
+        {
+            junction_side = 1;
+            is_left  = 1;
+            is_right = 0;
+        }
+    }
     else if (is_left || is_right)
+    {
+        /* 直角弯：按检测方向 */
         junction_type_from_camera = 3;
+        junction_side = is_left ? 1 : 2;
+    }
     else
     {
         junction_type_from_camera = 0;
+        junction_side = 0;
         turn_dbg_active = 0;
         return;
     }
 
-    /* 直角弯画斜线，T字/十字直行 */
     if (!is_left && !is_right)
     {
         turn_dbg_active = 0;
