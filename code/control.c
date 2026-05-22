@@ -4,8 +4,11 @@
 #include "motor.h"
 #include "pid.h"
 #include "task1.h"
+#include "task2.h"
 #include "zf_device_ips200.h"
 #include <stdlib.h>
+
+uint8 control_task_mode = 2;  /* 1=task1(直角弯计数), 2=task2(T字路口序列) */
 
 static IncrementalPI_t speed_pid_l;
 static IncrementalPI_t speed_pid_r;
@@ -61,7 +64,10 @@ void Control_Init(void)
     IncrementalPI_Init(&speed_pid_l, speed_kp, speed_ki);
     IncrementalPI_Init(&speed_pid_r, speed_kp, speed_ki);
     PositionPD_Init(&turn_pid, turn_kp, turn_kd);
-    Task1_Init();
+    if (control_task_mode == 1)
+        Task1_Init();
+    else
+        Task2_Init();
     start_ticks = 0;
     control_reset_runtime();
 }
@@ -172,38 +178,114 @@ static void update_targets_from_camera(void)
     float error;
     float turn;
 
-    // 进弯用3帧确认，出弯靠IMU偏航角变化超过60度判断
-    static uint8  turn_entry_cnt = 0;  // 连续检测帧数
-    static uint8  turn_active = 0;     // 是否处于直角弯状态
-    static float turn_entry_yaw = 0;   // 进弯时的偏航角
+    /* ---- 转弯状态机（task1/task2 共用变量） ---- */
+    static uint8  turn_entry_cnt  = 0;
+    static uint8  turn_active     = 0;
+    static float  turn_entry_yaw  = 0;
+    static uint8  turn_junc_type  = 0;
 
-    if (junction_type_from_camera >= 3)
-    {
-        if (turn_entry_cnt < 255) turn_entry_cnt++;
-    }
-    else
-    {
-        turn_entry_cnt = 0;
-    }
+    /* task2 直行T字路口确认 */
+    static uint8  straight_t_seen  = 0;
+    static uint8  straight_t_gone  = 0;
+    static uint8  straight_t_state = 0;
 
-    if (!turn_active)
+    /* ===== task1 模式：只检测直角弯(junction_type>=3)，75° 出弯 ===== */
+    if (control_task_mode == 1)
     {
-        if (turn_entry_cnt >= 3)
+        if (junction_type_from_camera >= 3)
         {
-            turn_active = 1;
-            turn_entry_yaw = imu_yaw;
+            if (turn_entry_cnt < 255) turn_entry_cnt++;
+        }
+        else
+        {
+            turn_entry_cnt = 0;
+        }
+
+        if (!turn_active)
+        {
+            if (turn_entry_cnt >= 3)
+            {
+                turn_active    = 1;
+                turn_entry_yaw = imu_yaw;
+            }
+        }
+        else
+        {
+            float dyaw = imu_yaw - turn_entry_yaw;
+            if (dyaw < 0) dyaw = -dyaw;
+            if (dyaw > 180.0f) dyaw = 360.0f - dyaw;
+            if (dyaw >= 75.0f)
+            {
+                turn_active = 0;
+                Task1_CountTurn();
+            }
         }
     }
+    /* ===== task2 模式：检测 junction_side!=0，85° 出弯，T字路口序列 ===== */
     else
     {
-        // 计算偏航角变化（处理0-360回绕）
-        float dyaw = imu_yaw - turn_entry_yaw;
-        if (dyaw < 0) dyaw = -dyaw;
-        if (dyaw > 180.0f) dyaw = 360.0f - dyaw;
-        if (dyaw >= 75.0f)
+        if (junction_side != 0)
         {
-            turn_active = 0;
-            Task1_CountTurn();  /* IMU 确认转弯完成，计一次 */
+            if (turn_entry_cnt < 255) turn_entry_cnt++;
+        }
+        else
+        {
+            turn_entry_cnt = 0;
+        }
+
+        if (!turn_active)
+        {
+            if (turn_entry_cnt >= 3)
+            {
+                turn_active    = 1;
+                turn_junc_type = junction_type_from_camera;
+                turn_entry_yaw = imu_yaw;
+            }
+        }
+        else
+        {
+            float dyaw = imu_yaw - turn_entry_yaw;
+            if (dyaw < 0) dyaw = -dyaw;
+            if (dyaw > 180.0f) dyaw = 360.0f - dyaw;
+            if (dyaw >= 85.0f)
+            {
+                turn_active = 0;
+                if (turn_junc_type == 1)
+                    Task2_TComplete();
+                else
+                    Task2_CountTurn();
+            }
+        }
+
+        /* 直行T字路口通过确认 */
+        if (turn_active)
+        {
+            straight_t_state = 0;
+            straight_t_seen  = 0;
+            straight_t_gone  = 0;
+        }
+        else if (junction_type_from_camera == 1 && junction_side == 0)
+        {
+            straight_t_seen++;
+            if (straight_t_seen > 250) straight_t_seen = 250;
+            straight_t_gone = 0;
+            if (straight_t_seen >= 5) straight_t_state = 1;
+        }
+        else if (straight_t_state == 1)
+        {
+            straight_t_gone++;
+            straight_t_seen = 0;
+            if (straight_t_gone >= 10)
+            {
+                Task2_TSkip();
+                straight_t_state = 0;
+                straight_t_gone = 0;
+            }
+        }
+        else
+        {
+            straight_t_seen  = 0;
+            straight_t_gone  = 0;
         }
     }
 
@@ -220,7 +302,7 @@ static void update_targets_from_camera(void)
     if(turn_limit > base_speed_target) turn_limit = base_speed_target;
     turn_output = clamp_i16((int32)turn, -turn_limit, turn_limit);
 
-    // Boost turn on confirmed sharp right-angle turn
+    // 转弯已确认，加大打角
     if (turn_active)
     {
         turn_output = (int16)(turn_output * CONTROL_SHARP_TURN_GAIN);
@@ -292,11 +374,23 @@ void Control_Task10ms(void)
 
     Motor_SetPWM(pwm_l, pwm_r);
 
-    Task1_Update();
-    if (Task1_IsFinished())
+    if (control_task_mode == 1)
     {
-        base_speed_cmd = 0;
-        control_reset_runtime();
+        Task1_Update();
+        if (Task1_IsFinished())
+        {
+            base_speed_cmd = 0;
+            control_reset_runtime();
+        }
+    }
+    else
+    {
+        Task2_Update();
+        if (Task2_IsFinished())
+        {
+            base_speed_cmd = 0;
+            control_reset_runtime();
+        }
     }
 }
 

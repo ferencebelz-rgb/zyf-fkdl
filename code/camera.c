@@ -11,8 +11,10 @@
  */
 
 #include "camera.h"
+#include "control.h"
 #include "imu.h"
 #include "task1.h"
+#include "task2.h"
 #include "zf_device_ips200.h"
 #include "zf_device_mt9v03x_double.h"
 #include "zf_driver_dma.h"
@@ -36,7 +38,9 @@
 
 int16 line_mid[MT9V03X_1_H];         /* 各行的中线列坐标，供 control.c 前视用 */
 int16 track_offset = 0;              /* 赛道偏移量（像素），供 control.c 转向用 */
-uint8 junction_type_from_camera = 0; /* 0=直道 1=T/直角 2=十字/L 3=急转弯 */
+uint8 junction_type_from_camera = 0; /* 0=直道 1=T字路口 2=十字 3=直角弯 */
+uint8 junction_side = 0;           /* 0=无路口, 1=左转, 2=右转 */
+uint8 t_junction_seen = 0;         /* 当前帧检测到T字路口（含直行通过的 */
 static uint8 line_lost_count = 0;    /* 连续丢线行数统计 */
 
 /* =================== 双缓冲缓冲区定义 =================== */
@@ -282,6 +286,7 @@ static void detect_boundary_sharp_turn(int left_edge[], int right_edge[])
 
 /* =============== Otsu 大津法自适应二值化 =============== */
 
+/* =============== 框检测直角弯（task1 使用） =============== */
 static void detect_box_sharp_turn(void)
 {
     uint16 x0, y0, x1, y1;
@@ -324,6 +329,42 @@ static void detect_box_sharp_turn(void)
         junction_type_from_camera = 0;
         turn_dbg_active = 0;
         return;
+    }
+
+    /* 拐角确认：命中行上下5行内，至少2行有连续50白点才认定出口 */
+    {
+        int hit_y = is_left_turn ? left_hit_y : right_hit_y;
+        int chk_top = hit_y - 5;
+        int chk_bot = hit_y + 5;
+        if (chk_top < 0) chk_top = 0;
+        if (chk_bot >= MT9V03X_1_H) chk_bot = MT9V03X_1_H - 1;
+
+        int pass_rows = 0;
+        for (int row = chk_top; row <= chk_bot; row++)
+        {
+            int max_run = 0;
+            int run = 0;
+            for (int col = 0; col < MT9V03X_1_W; col++)
+            {
+                if (process_image[row][col] != 0)
+                {
+                    run++;
+                    if (run > max_run) max_run = run;
+                }
+                else
+                {
+                    run = 0;
+                }
+            }
+            if (max_run >= 50) pass_rows++;
+        }
+
+        if (pass_rows < 2)
+        {
+            junction_type_from_camera = 0;
+            turn_dbg_active = 0;
+            return;
+        }
     }
 
     int start_x = (int)process_line_mid[MT9V03X_1_H - 1];
@@ -373,6 +414,184 @@ static void detect_box_sharp_turn(void)
     turn_dbg_corner_x = corner_x;
     turn_dbg_corner_y = corner_y;
     turn_dbg_is_left = is_left_turn;
+}
+
+/* =============== 中心框边缘检测转弯 + T字/十字路口 =============== */
+/*
+ * 原理：
+ *   扫描中心框四条边，根据白线出现的边组合分类：
+ *     下+左         → 左直角弯   (type 3)
+ *     下+右         → 右直角弯   (type 3)
+ *     下+左+上       → 左T字路口  (type 1, 触发左转)
+ *     下+右+上       → 右T字路口  (type 1, 触发右转)
+ *     下+左+右       → 正T字路口  (type 1, 方向不确定不走线)
+ *     下+左+右+上    → 十字路口   (type 2)
+ *   type 1 和 type 3 均触发转弯，type 2 直行。
+ *   只判断有无，不关心数量。
+ */
+static void detect_box_edge_turn(int left_edge[], int right_edge[])
+{
+    uint16 x0, y0, x1, y1;
+    uint8 top_hit = 0, bottom_hit = 0, left_hit = 0, right_hit = 0;
+    uint16 side_scan_start;
+    int left_hit_y = -1;
+    int right_hit_y = -1;
+
+    get_turn_detect_box(&x0, &y0, &x1, &y1);
+    side_scan_start = y0 + 1;
+    if (side_scan_start <= MT9V03X_1_H / 2)
+        side_scan_start = MT9V03X_1_H / 2 + 1;
+
+    for (uint16 x = x0; x <= x1 && !top_hit; x++)
+        if (process_image[y0][x] != 0) top_hit = 1;
+    for (uint16 x = x0; x <= x1 && !bottom_hit; x++)
+        if (process_image[y1][x] != 0) bottom_hit = 1;
+    for (uint16 y = side_scan_start; y < y1 && !left_hit; y++)
+    {
+        if (process_image[y][x0] != 0)
+        {
+            left_hit = 1;
+            left_hit_y = y;
+        }
+    }
+    for (uint16 y = side_scan_start; y < y1 && !right_hit; y++)
+    {
+        if (process_image[y][x1] != 0)
+        {
+            right_hit = 1;
+            right_hit_y = y;
+        }
+    }
+
+    if (!bottom_hit)
+    {
+        junction_type_from_camera = 0;
+        junction_side = 0;
+        t_junction_seen = 0;
+        turn_dbg_active = 0;
+        return;
+    }
+
+    /* 分类：仅下+左=直角弯左，仅下+右=直角弯右，其余=查序列 */
+    int is_left  = bottom_hit && left_hit  && !right_hit && !top_hit;
+    int is_right = bottom_hit && right_hit && !left_hit  && !top_hit;
+
+    if (is_left || is_right)
+    {
+        junction_type_from_camera = 3;
+        junction_side = is_left ? 1 : 2;
+        t_junction_seen = 0;
+    }
+    else if (bottom_hit && (top_hit || left_hit || right_hit))
+    {
+        /* T字/十字路口：方向由序列写死 */
+        uint8 t_dir = Task2_GetNextTDir();
+        junction_type_from_camera = 1;
+        junction_side = 0;
+        t_junction_seen = 1;
+        is_left  = 0;
+        is_right = 0;
+
+        if (t_dir == 0)      { junction_side = 2; is_right = 1; }
+        else if (t_dir == 1) { junction_side = 1; is_left  = 1; }
+        /* t_dir == 2 直行，is_left/is_right 保持 0 */
+    }
+    else
+    {
+        junction_type_from_camera = 0;
+        junction_side = 0;
+        t_junction_seen = 0;
+        turn_dbg_active = 0;
+        return;
+    }
+
+    if (!is_left && !is_right)
+    {
+        turn_dbg_active = 0;
+        return;
+    }
+
+    /* 拐角确认：命中行上下5行内，至少2行有连续50白点才认定出口 */
+    {
+        int hit_y = is_left ? left_hit_y : right_hit_y;
+        if (hit_y < 0) hit_y = y1;
+        int chk_top = hit_y - 5;
+        int chk_bot = hit_y + 5;
+        if (chk_top < 0) chk_top = 0;
+        if (chk_bot >= MT9V03X_1_H) chk_bot = MT9V03X_1_H - 1;
+
+        int pass_rows = 0;
+        for (int row = chk_top; row <= chk_bot; row++)
+        {
+            int max_run = 0;
+            int run = 0;
+            for (int col = 0; col < MT9V03X_1_W; col++)
+            {
+                if (process_image[row][col] != 0)
+                {
+                    run++;
+                    if (run > max_run) max_run = run;
+                }
+                else
+                    run = 0;
+            }
+            if (max_run >= 50) pass_rows++;
+        }
+
+        if (pass_rows < 2)
+        {
+            junction_type_from_camera = 0;
+            junction_side = 0;
+            t_junction_seen = 0;
+            turn_dbg_active = 0;
+            return;
+        }
+    }
+
+    int start_x = (int)process_line_mid[MT9V03X_1_H - 1];
+    int start_y = MT9V03X_1_H - 1;
+    int corner_y = is_left ? left_hit_y : right_hit_y;
+    int end_x = is_left ? SHARP_TURN_EDGE_MARGIN
+                         : MT9V03X_1_W - 1 - SHARP_TURN_EDGE_MARGIN;
+    int end_y;
+
+    if (start_x < 0 || start_x >= MT9V03X_1_W) start_x = MT9V03X_1_W / 2;
+    if (corner_y < 0) corner_y = y1;
+
+    end_y = corner_y;
+    if (end_y < 0) end_y = 0;
+    if (end_y > start_y) end_y = start_y;
+
+    int dx = end_x - start_x;
+    int dy = end_y - start_y;
+    int steps = (abs(dy) > abs(dx)) ? abs(dy) : abs(dx);
+    if (steps < 1) steps = 1;
+
+    float x_inc = (float)dx / (float)steps;
+    float y_inc = (float)dy / (float)steps;
+    float x = (float)start_x;
+    float y = (float)start_y;
+
+    for (int s = 0; s <= steps; s++)
+    {
+        int row = (int)(y + 0.5f);
+        int col = (int)(x + 0.5f);
+        if (row >= 0 && row < MT9V03X_1_H && col >= 0 && col < MT9V03X_1_W)
+            process_line_mid[row] = (int16)col;
+        x += x_inc;
+        y += y_inc;
+    }
+    for (int row = 0; row < end_y; row++)
+        process_line_mid[row] = (int16)end_x;
+
+    turn_dbg_active  = 1;
+    turn_dbg_start_x = start_x;
+    turn_dbg_start_y = start_y;
+    turn_dbg_end_x   = end_x;
+    turn_dbg_end_y   = end_y;
+    turn_dbg_corner_x = is_left ? (int)x0 : (int)x1;
+    turn_dbg_corner_y = corner_y;
+    turn_dbg_is_left = is_left;
 }
 
 static uint8 compute_otsu_threshold(void)
@@ -590,8 +809,11 @@ void image_process_task(void)
             }
         }
 
-        /* 步骤 4：检测直角弯（复用搜线阶段的左右边界，过滤赛道外噪声 */
-        detect_box_sharp_turn();
+        /* 步骤 4：检测转弯（task1用框检测直角弯，task2用中心框边缘+T字路口） */
+        if (control_task_mode == 1)
+            detect_box_sharp_turn();
+        else
+            detect_box_edge_turn(boundary_left, boundary_right);
 
         line_lost_count = (lost_line_count > 255) ? 255 : (uint8)lost_line_count;
 
@@ -639,7 +861,7 @@ void image_display_task(void)
     /* 显示二值化后的摄像头图像 */
     ips200_show_gray_image(0, 0, display_image[0], MT9V03X_1_W, MT9V03X_1_H, MT9V03X_1_W, MT9V03X_1_H, 0);
 
-    /* 绿色框表示当前用于识别直角弯的扫描框 */
+    /* 绿色检测框 */
     {
         uint16 x0, y0, x1, y1;
         get_turn_detect_box(&x0, &y0, &x1, &y1);
@@ -680,10 +902,28 @@ void image_display_task(void)
     ips200_show_string(108, 122, "GX");
     ips200_show_int(126, 122, (int32)(gyro[0] * 57.3f), 4);
 
+    /* 路口类型 */
+    ips200_show_string(0, 130, "J:");
+    if (junction_type_from_camera == 1)
+        ips200_show_string(18, 130, "T");
+    else if (junction_type_from_camera == 3)
+        ips200_show_string(18, 130, turn_dbg_is_left ? "L90" : "R90");
+    else
+        ips200_show_string(18, 130, "---");
+
     ips200_show_string(0, 140, "T:");
-    ips200_show_int(18, 140, Task1_GetCount(), 2);
-    ips200_show_string(36, 140, "/");
-    ips200_show_int(42, 140, TASK1_TURN_TARGET, 2);
+    if (control_task_mode == 1)
+    {
+        ips200_show_int(18, 140, Task1_GetCount(), 2);
+        ips200_show_string(36, 140, "/");
+        ips200_show_int(42, 140, TASK1_TURN_TARGET, 2);
+    }
+    else
+    {
+        ips200_show_int(18, 140, Task2_GetCount(), 2);
+        ips200_show_string(36, 140, "/");
+        ips200_show_int(42, 140, TASK2_TURN_TARGET, 2);
+    }
 
 #if ENABLE_TURN_DEBUG
     /* 直角弯诊断叠加层 */
