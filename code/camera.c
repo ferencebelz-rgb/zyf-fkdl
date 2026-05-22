@@ -331,9 +331,11 @@ static void detect_box_sharp_turn(void)
         return;
     }
 
-    /* 拐角确认：命中行上下5行内，至少2行有连续50白点才认定出口 */
+    /* 拐角确认：命中行上下5行内，至少2行从边界向内连续50白点才认定出口 */
     {
         int hit_y = is_left_turn ? left_hit_y : right_hit_y;
+        int edge_x = is_left_turn ? (int)x0 : (int)x1;
+        int col_step = is_left_turn ? 1 : -1;
         int chk_top = hit_y - 5;
         int chk_bot = hit_y + 5;
         if (chk_top < 0) chk_top = 0;
@@ -342,21 +344,15 @@ static void detect_box_sharp_turn(void)
         int pass_rows = 0;
         for (int row = chk_top; row <= chk_bot; row++)
         {
-            int max_run = 0;
             int run = 0;
-            for (int col = 0; col < MT9V03X_1_W; col++)
+            for (int col = edge_x; col >= 0 && col < MT9V03X_1_W; col += col_step)
             {
                 if (process_image[row][col] != 0)
-                {
                     run++;
-                    if (run > max_run) max_run = run;
-                }
                 else
-                {
-                    run = 0;
-                }
+                    break;
             }
-            if (max_run >= 50) pass_rows++;
+            if (run >= 50) pass_rows++;
         }
 
         if (pass_rows < 2)
@@ -511,10 +507,12 @@ static void detect_box_edge_turn(int left_edge[], int right_edge[])
         return;
     }
 
-    /* 拐角确认：命中行上下5行内，至少2行有连续50白点才认定出口 */
+    /* 拐角确认：命中行上下5行内，至少2行从边界向内连续50白点才认定出口 */
     {
         int hit_y = is_left ? left_hit_y : right_hit_y;
         if (hit_y < 0) hit_y = y1;
+        int edge_x = is_left ? (int)x0 : (int)x1;
+        int col_step = is_left ? 1 : -1;
         int chk_top = hit_y - 5;
         int chk_bot = hit_y + 5;
         if (chk_top < 0) chk_top = 0;
@@ -523,19 +521,15 @@ static void detect_box_edge_turn(int left_edge[], int right_edge[])
         int pass_rows = 0;
         for (int row = chk_top; row <= chk_bot; row++)
         {
-            int max_run = 0;
             int run = 0;
-            for (int col = 0; col < MT9V03X_1_W; col++)
+            for (int col = edge_x; col >= 0 && col < MT9V03X_1_W; col += col_step)
             {
                 if (process_image[row][col] != 0)
-                {
                     run++;
-                    if (run > max_run) max_run = run;
-                }
                 else
-                    run = 0;
+                    break;
             }
-            if (max_run >= 50) pass_rows++;
+            if (run >= 50) pass_rows++;
         }
 
         if (pass_rows < 2)
