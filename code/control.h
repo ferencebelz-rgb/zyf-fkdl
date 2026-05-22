@@ -10,10 +10,11 @@
 #define CONTROL_BASE_SPEED_MAX          900
 #define CONTROL_BASE_RAMP_STEP          4
 
-#define CONTROL_TURN_KP_DEFAULT         2.028f
-#define CONTROL_TURN_KD_DEFAULT         0.507f
+#define CONTROL_TURN_KP_DEFAULT         1.8f
+#define CONTROL_TURN_KD_DEFAULT         0.45f
 #define CONTROL_TURN_LIMIT_DEFAULT      180
-#define CONTROL_GYRO_DAMPING_GAIN       7.5f
+#define CONTROL_SHARP_TURN_GAIN         5.21f
+#define CONTROL_GYRO_DAMPING_GAIN       8.0f
 
 void Control_Init(void);
 void Control_Task10ms(void);

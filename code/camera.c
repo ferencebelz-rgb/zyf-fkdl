@@ -64,9 +64,46 @@ static int  turn_dbg_start_x = 0;
 static int  turn_dbg_start_y = 0;
 static int  turn_dbg_end_x   = 0;
 static int  turn_dbg_end_y   = 0;
+static int  turn_dbg_corner_x = 0;
+static int  turn_dbg_corner_y = 0;
 static int  turn_dbg_is_left = 0;
 
+static void draw_clamped_box(int x, int y, int radius, uint16 color)
+{
+    int x0 = x - radius;
+    int x1 = x + radius;
+    int y0 = y - radius;
+    int y1 = y + radius;
+
+    if (x0 < 0) x0 = 0;
+    if (x1 >= MT9V03X_1_W) x1 = MT9V03X_1_W - 1;
+    if (y0 < 0) y0 = 0;
+    if (y1 >= MT9V03X_1_H) y1 = MT9V03X_1_H - 1;
+
+    for (int px = x0; px <= x1; px++)
+    {
+        ips200_draw_point((uint16)px, (uint16)y0, color);
+        ips200_draw_point((uint16)px, (uint16)y1, color);
+    }
+    for (int py = y0; py <= y1; py++)
+    {
+        ips200_draw_point((uint16)x0, (uint16)py, color);
+        ips200_draw_point((uint16)x1, (uint16)py, color);
+    }
+}
+
 /* ==================== 初始化函数 ==================== */
+
+static void get_turn_detect_box(uint16 *x0, uint16 *y0, uint16 *x1, uint16 *y1)
+{
+    uint16 box_w = MT9V03X_1_W / 2;
+    uint16 box_h = MT9V03X_1_H / 2;
+
+    *x0 = (MT9V03X_1_W - box_w) / 2 - 24;
+    *y0 = (MT9V03X_1_H - box_h) / 2;
+    *x1 = *x0 + box_w + 48;
+    *y1 = MT9V03X_1_H - 1;
+}
 
 void cam_init(void)
 {
@@ -194,9 +231,12 @@ static void detect_boundary_sharp_turn(int left_edge[], int right_edge[])
     int end_y    = corner_row;
     int end_x    = is_left_turn ? SHARP_TURN_EDGE_MARGIN
                                 : MT9V03X_1_W - 1 - SHARP_TURN_EDGE_MARGIN;
+    int corner_x = edge[corner_row];
 
-    // 提前探测
-    end_y -= 20;
+    if (corner_x < 0 || corner_x >= MT9V03X_1_W)
+        corner_x = is_left_turn ? 0 : (MT9V03X_1_W - 1);
+
+    // 终点行与拐点行保持一致
     if (end_y < 0) end_y = 0;
     if (end_y > start_y) end_y = start_y;
 
@@ -235,10 +275,105 @@ static void detect_boundary_sharp_turn(int left_edge[], int right_edge[])
     turn_dbg_start_y = start_y;
     turn_dbg_end_x   = end_x;
     turn_dbg_end_y   = end_y;
+    turn_dbg_corner_x = corner_x;
+    turn_dbg_corner_y = corner_row;
     turn_dbg_is_left = is_left_turn;
 }
 
 /* =============== Otsu 大津法自适应二值化 =============== */
+
+static void detect_box_sharp_turn(void)
+{
+    uint16 x0, y0, x1, y1;
+    uint8 top_hit = 0, bottom_hit = 0, left_hit = 0, right_hit = 0;
+    uint16 side_scan_start;
+    int left_hit_y = -1;
+    int right_hit_y = -1;
+
+    get_turn_detect_box(&x0, &y0, &x1, &y1);
+    side_scan_start = y0 + 1;
+    if (side_scan_start <= MT9V03X_1_H / 2)
+        side_scan_start = MT9V03X_1_H / 2 + 1;
+
+    for (uint16 x = x0; x <= x1 && !top_hit; x++)
+        if (process_image[y0][x] != 0) top_hit = 1;
+    for (uint16 x = x0; x <= x1 && !bottom_hit; x++)
+        if (process_image[y1][x] != 0) bottom_hit = 1;
+    for (uint16 y = side_scan_start; y < y1 && !left_hit; y++)
+    {
+        if (process_image[y][x0] != 0)
+        {
+            left_hit = 1;
+            left_hit_y = y;
+        }
+    }
+    for (uint16 y = side_scan_start; y < y1 && !right_hit; y++)
+    {
+        if (process_image[y][x1] != 0)
+        {
+            right_hit = 1;
+            right_hit_y = y;
+        }
+    }
+
+    int is_left_turn = bottom_hit && left_hit && !right_hit && !top_hit;
+    int is_right_turn = bottom_hit && right_hit && !left_hit && !top_hit;
+
+    if (!is_left_turn && !is_right_turn)
+    {
+        junction_type_from_camera = 0;
+        turn_dbg_active = 0;
+        return;
+    }
+
+    int start_x = (int)process_line_mid[MT9V03X_1_H - 1];
+    int start_y = MT9V03X_1_H - 1;
+    int corner_x = is_left_turn ? (int)x0 : (int)x1;
+    int corner_y = is_left_turn ? left_hit_y : right_hit_y;
+    int end_x = is_left_turn ? SHARP_TURN_EDGE_MARGIN
+                             : MT9V03X_1_W - 1 - SHARP_TURN_EDGE_MARGIN;
+    int end_y;
+
+    if (start_x < 0 || start_x >= MT9V03X_1_W) start_x = MT9V03X_1_W / 2;
+    if (corner_y < 0) corner_y = y1;
+
+    end_y = corner_y;
+    if (end_y < 0) end_y = 0;
+    if (end_y > start_y) end_y = start_y;
+
+    int dx = end_x - start_x;
+    int dy = end_y - start_y;
+    int steps = (abs(dy) > abs(dx)) ? abs(dy) : abs(dx);
+    if (steps < 1) steps = 1;
+
+    float x_inc = (float)dx / (float)steps;
+    float y_inc = (float)dy / (float)steps;
+    float x = (float)start_x;
+    float y = (float)start_y;
+
+    for (int s = 0; s <= steps; s++)
+    {
+        int row = (int)(y + 0.5f);
+        int col = (int)(x + 0.5f);
+        if (row >= 0 && row < MT9V03X_1_H && col >= 0 && col < MT9V03X_1_W)
+            process_line_mid[row] = (int16)col;
+        x += x_inc;
+        y += y_inc;
+    }
+
+    for (int row = 0; row < end_y; row++)
+        process_line_mid[row] = (int16)end_x;
+
+    junction_type_from_camera = 3;
+    turn_dbg_active = 1;
+    turn_dbg_start_x = start_x;
+    turn_dbg_start_y = start_y;
+    turn_dbg_end_x = end_x;
+    turn_dbg_end_y = end_y;
+    turn_dbg_corner_x = corner_x;
+    turn_dbg_corner_y = corner_y;
+    turn_dbg_is_left = is_left_turn;
+}
 
 static uint8 compute_otsu_threshold(void)
 {
@@ -456,7 +591,7 @@ void image_process_task(void)
         }
 
         /* 步骤 4：检测直角弯（复用搜线阶段的左右边界，过滤赛道外噪声 */
-        detect_boundary_sharp_turn(boundary_left, boundary_right);
+        detect_box_sharp_turn();
 
         line_lost_count = (lost_line_count > 255) ? 255 : (uint8)lost_line_count;
 
@@ -503,6 +638,16 @@ void image_display_task(void)
 
     /* 显示二值化后的摄像头图像 */
     ips200_show_gray_image(0, 0, display_image[0], MT9V03X_1_W, MT9V03X_1_H, MT9V03X_1_W, MT9V03X_1_H, 0);
+
+    /* 绿色框表示当前用于识别直角弯的扫描框 */
+    {
+        uint16 x0, y0, x1, y1;
+        get_turn_detect_box(&x0, &y0, &x1, &y1);
+        ips200_draw_line(x0, y0, x1, y0, RGB565_GREEN);
+        ips200_draw_line(x1, y0, x1, y1, RGB565_GREEN);
+        ips200_draw_line(x1, y1, x0, y1, RGB565_GREEN);
+        ips200_draw_line(x0, y1, x0, y0, RGB565_GREEN);
+    }
 
     /* 用红点画中线、蓝点画左边界、绿点画右边界 */
     for (int i = 0; i < MT9V03X_1_H; i++)
@@ -554,6 +699,9 @@ void image_display_task(void)
 
         /* 黄色点标记终点（弯角瞄准点） */
         ips200_draw_point((uint16)turn_dbg_end_x, (uint16)turn_dbg_end_y, RGB565_YELLOW);
+
+        /* 紫色小框标记识别到的框边拐点 */
+        draw_clamped_box(turn_dbg_corner_x, turn_dbg_corner_y, 3, RGB565_MAGENTA);
 
         /* 右上角显示转弯方向 */
         if (turn_dbg_is_left)

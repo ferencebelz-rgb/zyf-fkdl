@@ -200,7 +200,7 @@ static void update_targets_from_camera(void)
         float dyaw = imu_yaw - turn_entry_yaw;
         if (dyaw < 0) dyaw = -dyaw;
         if (dyaw > 180.0f) dyaw = 360.0f - dyaw;
-        if (dyaw >= 60.0f)
+        if (dyaw >= 75.0f)
         {
             turn_active = 0;
             Task1_CountTurn();  /* IMU 确认转弯完成，计一次 */
@@ -223,7 +223,7 @@ static void update_targets_from_camera(void)
     // Boost turn on confirmed sharp right-angle turn
     if (turn_active)
     {
-        turn_output = (int16)(turn_output * 5);
+        turn_output = (int16)(turn_output * CONTROL_SHARP_TURN_GAIN);
         turn_output = clamp_i16((int32)turn_output, -turn_limit, turn_limit);
     }
 #endif
