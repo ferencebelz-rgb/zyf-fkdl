@@ -247,7 +247,7 @@ static void update_targets_from_camera(void)
             float dyaw = imu_yaw - turn_entry_yaw;
             if (dyaw < 0) dyaw = -dyaw;
             if (dyaw > 180.0f) dyaw = 360.0f - dyaw;
-            if (dyaw >= 85.0f)
+            if (dyaw >= 75.0f)
             {
                 turn_active = 0;
                 if (turn_junc_type == 1)
