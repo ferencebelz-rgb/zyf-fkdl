@@ -141,6 +141,29 @@ static void detect_box_edge_turn(int left_edge[], int right_edge[])
         return;
     }
 
+    /* 找拐点Y坐标：沿有白线的侧边从上往下找最靠近底部的白点 */
+    {
+        int16 cy = -1;
+        int16 edge_x = (left_hit) ? (int16)x0 : ((right_hit) ? (int16)x1 : -1);
+        if (edge_x >= 0)
+        {
+            for (int _y = (int)y1; _y > (int)y0; _y--)
+            {
+                if (process_image[_y][edge_x] != 0)
+                {
+                    cy = (int16)_y;
+                    break;
+                }
+            }
+        }
+        /* 拐点必须到屏幕 1/3 以下才允许补线 */
+        if (cy < 0 || cy < (int16)(MT9V03X_1_H / 3))
+        {
+            left_hit  = 0;
+            right_hit = 0;
+        }
+    }
+
     /* 分类 */
     int is_cross   = bottom_hit && left_hit && right_hit && top_hit;
     int is_t_left  = bottom_hit && left_hit  && top_hit && !right_hit;
