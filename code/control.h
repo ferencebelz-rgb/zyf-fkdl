@@ -16,6 +16,8 @@
 #define CONTROL_SHARP_TURN_GAIN         5.21f
 #define CONTROL_GYRO_DAMPING_GAIN       8.0f
 
+extern uint8 control_task_mode;  /* 1=task1, 2=task2 */
+
 void Control_Init(void);
 void Control_Task10ms(void);
 void Control_DisplayStatusTask(void);

@@ -31,7 +31,7 @@ int core0_main(void)
 
     cpu_wait_event_ready();
 
-    // 等待 KEY1 启动任务1 / KEY4 切换负压风扇
+    // 等待 KEY1 启动任务1 / KEY2 启动任务2 / KEY4 切换负压风扇
     while(TRUE)
     {
         key_scanner();
@@ -39,7 +39,15 @@ int core0_main(void)
         if(key_get_state(KEY_1) == KEY_SHORT_PRESS)
         {
             key_clear_state(KEY_1);
+            control_task_mode = 1;
             break;  // 启动任务1（直角弯计数）
+        }
+
+        if(key_get_state(KEY_2) == KEY_SHORT_PRESS)
+        {
+            key_clear_state(KEY_2);
+            control_task_mode = 2;
+            break;  // 启动任务2（T字路口序列）
         }
 
         if(key_get_state(KEY_4) == KEY_SHORT_PRESS)

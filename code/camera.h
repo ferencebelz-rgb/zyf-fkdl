@@ -37,6 +37,11 @@ extern int16 line_mid[MT9V03X_1_H];
 extern int16 track_offset;
 
 extern uint8 junction_type_from_camera;
+extern uint8 junction_side;
+extern uint8 junction_visual_type;
+extern uint8 junction_dbg_left_hit;
+extern uint8 junction_dbg_top_hit;
+extern uint8 junction_dbg_right_hit;
 
 
 
