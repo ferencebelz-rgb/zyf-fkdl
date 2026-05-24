@@ -297,10 +297,17 @@ static void detect_box_edge_turn(void)
         }
     }
 
-    /* 左边扫描：从 y0+1 到 y1，向下确认 10 行，≥50 连续白像素，≥2 行通过 */
+    /* 左边扫描：从 y0+1 到 y1，边界向内 8 列找白点，向下确认 10 行，≥30 连续白像素，≥2 行通过 */
     for (uint16 y = side_scan_start; y < y1 && !left_hit; y++)
     {
-        if (process_image[y][x0] != 0)
+        int hit_col = -1;
+        for (int off = 0; off < 8; off++)
+        {
+            int c = (int)x0 + off;
+            if (c >= MT9V03X_1_W) break;
+            if (process_image[y][c] != 0) { hit_col = c; break; }
+        }
+        if (hit_col >= 0)
         {
             int chk_top = (int)y;  if (chk_top < 0) chk_top = 0;
             int chk_bot = (int)y + 10;  if (chk_bot >= MT9V03X_1_H) chk_bot = MT9V03X_1_H - 1;
@@ -318,10 +325,17 @@ static void detect_box_edge_turn(void)
         }
     }
 
-    /* 右边扫描：从 y0+1 到 y1，向下确认 10 行，≥50 连续白像素，≥2 行通过 */
+    /* 右边扫描：从 y0+1 到 y1，边界向内 8 列找白点，向下确认 10 行，≥30 连续白像素，≥2 行通过 */
     for (uint16 y = side_scan_start; y < y1 && !right_hit; y++)
     {
-        if (process_image[y][x1] != 0)
+        int hit_col = -1;
+        for (int off = 0; off < 8; off++)
+        {
+            int c = (int)x1 - off;
+            if (c < 0) break;
+            if (process_image[y][c] != 0) { hit_col = c; break; }
+        }
+        if (hit_col >= 0)
         {
             int chk_top = (int)y;  if (chk_top < 0) chk_top = 0;
             int chk_bot = (int)y + 10;  if (chk_bot >= MT9V03X_1_H) chk_bot = MT9V03X_1_H - 1;

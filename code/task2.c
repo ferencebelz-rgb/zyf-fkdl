@@ -8,7 +8,7 @@ static uint8  t_seq_index = 0;
 static uint8  beep_timer = 0;
 
 /* T字路口固定序列: 右(0), 左(1), 左(1), 右(0), 直行(2), 直行(2) */
-static const uint8 t_seq[TASK2_T_SEQ_LEN] = {0, 1, 1, 0, 2, 2};
+static const uint8 t_seq[TASK2_T_SEQ_LEN] = {0, 0, 1, 1, 0, 2, 2};
 
 void Task2_Init(void)
 {
@@ -24,6 +24,11 @@ void Task2_CountTurn(void)
     if (turn_count < 255)
     {
         turn_count++;
+    }
+    if (t_seq_index < TASK2_T_SEQ_LEN - 1)
+    {
+        t_seq_index++;
+        beep_timer = TASK2_BEEP_TICKS;
     }
 }
 

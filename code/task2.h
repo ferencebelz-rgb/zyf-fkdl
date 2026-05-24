@@ -4,7 +4,7 @@
 #include "zf_common_headfile.h"
 
 #define TASK2_TURN_TARGET   8     /* 目标转弯总次数 */
-#define TASK2_T_SEQ_LEN     6     /* T字路口固定序列长度 */
+#define TASK2_T_SEQ_LEN     7     /* T字路口固定序列长度 */
 #define TASK2_BEEP_TICKS   10     /* 蜂鸣器响铃时长 (10ms/tick) */
 
 void Task2_Init(void);
