@@ -1,51 +1,48 @@
 /*
- * camera.c - MT9V03X 双摄像头图像处理与中线提取
+ * camera.c - MT9V03X 鍙屾憚鍍忓ご鍥惧儚澶勭悊涓庝腑绾挎彁鍙?
  *
- * 本模块负责：
- *   1) 从摄像头 DMA 缓冲区获取一帧原始灰度图
- *   2) 用 Otsu 大津法自适应二值化
- *   3) 逐行搜索赛道左右边界，计算中线
- *   4) 直角弯检测（边界丢失法 + 角点定位）
- *   5) 加权平均计算赛道偏移量（供 control.c 使用）
- *   6) 显示摄像头图像 + 中线 + IMU 陀螺仪数据
+ * 鏈ā鍧楄礋璐ｏ細
+ *   1) 浠庢憚鍍忓ご DMA 缂撳啿鍖鸿幏鍙栦竴甯у師濮嬬伆搴﹀浘
+ *   2) 鐢?Otsu 澶ф触娉曡嚜閫傚簲浜屽€煎寲
+ *   3) 閫愯鎼滅储璧涢亾宸﹀彸杈圭晫锛岃绠椾腑绾?
+ *   4) 鐩磋寮娴嬶紙杈圭晫涓㈠け娉?+ 瑙掔偣瀹氫綅锛?
+ *   5) 鍔犳潈骞冲潎璁＄畻璧涢亾鍋忕Щ閲忥紙渚?control.c 浣跨敤锛?
+ *   6) 鏄剧ず鎽勫儚澶村浘鍍?+ 涓嚎 + IMU 闄€铻轰华鏁版嵁
  */
 
 #include "camera.h"
 #include "control.h"
 #include "imu.h"
 #include "task1.h"
-#include "task2.h"
 #include "zf_device_ips200.h"
 #include "zf_device_mt9v03x_double.h"
 #include "zf_driver_dma.h"
 #include <string.h>
 
-/* ======================== 编译开关 ======================== */
+/* ======================== 缂栬瘧寮€鍏?======================== */
 
-#define ENABLE_DISPLAY 1             /* 1=开启屏幕显示，比赛时可关闭以提高帧率 */
-#define LOST_LINE_REPLACE_VAL (MT9V03X_1_W / 2)  /* 丢线时填充图像中心 */
-#define TRACK_LINE_IS_BLACK 0        /* 1=白色底板黑色赛道  0=黑色底板白色赛道 */
-#define ENABLE_TURN_DEBUG 1          /* 1=显示直角弯诊断线条（赛后清零 */
+#define ENABLE_DISPLAY 1             /* 1=寮€鍚睆骞曟樉绀猴紝姣旇禌鏃跺彲鍏抽棴浠ユ彁楂樺抚鐜?*/
+#define LOST_LINE_REPLACE_VAL (MT9V03X_1_W / 2)  /* 涓㈢嚎鏃跺～鍏呭浘鍍忎腑蹇?*/
+#define TRACK_LINE_IS_BLACK 0        /* 1=鐧借壊搴曟澘榛戣壊璧涢亾  0=榛戣壊搴曟澘鐧借壊璧涢亾 */
+#define ENABLE_TURN_DEBUG 1          /* 1=鏄剧ず鐩磋寮瘖鏂嚎鏉★紙璧涘悗娓呴浂 */
 
-/* ====================== 二值化参数 ====================== */
+/* ====================== 浜屽€煎寲鍙傛暟 ====================== */
 
-#define THRESHOLD_DARK_MIN         30 /* Otsu 结果的最小偏移补偿 */
-#define THRESHOLD_DARK_MAX         30 /* 最大偏移补偿（与 MIN 相等时固定偏移 */
-#define THRESHOLD_CLAMP_LO         30 /* Otsu 结果下限 */
-#define THRESHOLD_CLAMP_HI        220 /* Otsu 结果上限 */
+#define THRESHOLD_DARK_MIN         30 /* Otsu 缁撴灉鐨勬渶灏忓亸绉昏ˉ鍋?*/
+#define THRESHOLD_DARK_MAX         30 /* 鏈€澶у亸绉昏ˉ鍋匡紙涓?MIN 鐩哥瓑鏃跺浐瀹氬亸绉?*/
+#define THRESHOLD_CLAMP_LO         30 /* Otsu 缁撴灉涓嬮檺 */
+#define THRESHOLD_CLAMP_HI        220 /* Otsu 缁撴灉涓婇檺 */
 
-/* ====================== 对外全局变量 ====================== */
+/* ====================== 瀵瑰鍏ㄥ眬鍙橀噺 ====================== */
 
-int16 line_mid[MT9V03X_1_H];         /* 各行的中线列坐标，供 control.c 前视用 */
-int16 track_offset = 0;              /* 赛道偏移量（像素），供 control.c 转向用 */
-uint8 junction_type_from_camera = 0; /* 0=直道 1=T字路口 2=十字 3=直角弯 */
-uint8 junction_side = 0;           /* 0=无路口, 1=左转, 2=右转 */
-uint8 t_junction_seen = 0;         /* 当前帧检测到T字路口（含直行通过的 */
-static uint8 line_lost_count = 0;    /* 连续丢线行数统计 */
+int16 line_mid[MT9V03X_1_H];         /* 鍚勮鐨勪腑绾垮垪鍧愭爣锛屼緵 control.c 鍓嶈鐢?*/
+int16 track_offset = 0;              /* 璧涢亾鍋忕Щ閲忥紙鍍忕礌锛夛紝渚?control.c 杞悜鐢?*/
+uint8 junction_type_from_camera = 0; /* 0=鐩撮亾 1=T瀛楄矾鍙?2=鍗佸瓧 3=鐩磋寮?*/
+static uint8 line_lost_count = 0;    /* 杩炵画涓㈢嚎琛屾暟缁熻 */
 
-/* =================== 双缓冲缓冲区定义 =================== */
+/* =================== 鍙岀紦鍐茬紦鍐插尯瀹氫箟 =================== */
 
-/* raw_snapshot：从 DMA 缓冲区稳定拷贝的一帧原始灰度图 */
+/* raw_snapshot锛氫粠 DMA 缂撳啿鍖虹ǔ瀹氭嫹璐濈殑涓€甯у師濮嬬伆搴﹀浘 */
 static uint8 raw_snapshot[MT9V03X_1_H][MT9V03X_1_W];
 static uint8 binary_buf_0[MT9V03X_1_H][MT9V03X_1_W];
 static uint8 binary_buf_1[MT9V03X_1_H][MT9V03X_1_W];
@@ -53,7 +50,7 @@ static uint8 binary_buf_1[MT9V03X_1_H][MT9V03X_1_W];
 static int16 line_mid_buf_0[MT9V03X_1_H];
 static int16 line_mid_buf_1[MT9V03X_1_H];
 
-/* 处理缓冲区和显示缓冲区指针，每帧交换一次，避免 DMA 和显示冲突 */
+/* 澶勭悊缂撳啿鍖哄拰鏄剧ず缂撳啿鍖烘寚閽堬紝姣忓抚浜ゆ崲涓€娆★紝閬垮厤 DMA 鍜屾樉绀哄啿绐?*/
 static uint8 (*process_image)[MT9V03X_1_W] = binary_buf_0;
 static int16 *process_line_mid = line_mid_buf_0;
 
@@ -62,7 +59,7 @@ static int16 *display_line_mid = line_mid_buf_1;
 
 static uint8 image_ready = 0;
 
-/* 直角弯调试叠加数据（process 写入，display 读取 */
+/* 鐩磋寮皟璇曞彔鍔犳暟鎹紙process 鍐欏叆锛宒isplay 璇诲彇 */
 static int  turn_dbg_active  = 0;
 static int  turn_dbg_start_x = 0;
 static int  turn_dbg_start_y = 0;
@@ -96,7 +93,7 @@ static void draw_clamped_box(int x, int y, int radius, uint16 color)
     }
 }
 
-/* ==================== 初始化函数 ==================== */
+/* ==================== 鍒濆鍖栧嚱鏁?==================== */
 
 static void get_turn_detect_box(uint16 *x0, uint16 *y0, uint16 *x1, uint16 *y1)
 {
@@ -111,16 +108,16 @@ static void get_turn_detect_box(uint16 *x0, uint16 *y0, uint16 *x1, uint16 *y1)
 
 void cam_init(void)
 {
-    /* 设置曝光时间为 400（默认值，可根据环境调整 */
+    /* 璁剧疆鏇濆厜鏃堕棿涓?400锛堥粯璁ゅ€硷紝鍙牴鎹幆澧冭皟鏁?*/
     mt9v03x_set_confing_buffer_1[MT9V03X_DOUBLE_EXP_TIME][1] = 400;
     mt9v03x_double_init(mt9v03x_1);
 }
 
-/* ================== 缓冲区交换 ================== */
+/* ================== 缂撳啿鍖轰氦鎹?================== */
 
 static void image_swap_buffer(void)
 {
-    /* O(1) 时间交换 process/display 指针，避免大块内存拷贝 */
+    /* O(1) 鏃堕棿浜ゆ崲 process/display 鎸囬拡锛岄伩鍏嶅ぇ鍧楀唴瀛樻嫹璐?*/
     uint8 (*temp_image)[MT9V03X_1_W] = process_image;
     process_image = display_image;
     display_image = temp_image;
@@ -130,17 +127,17 @@ static void image_swap_buffer(void)
     display_line_mid = temp_line_mid;
 }
 
-/* ================== 稳定帧拷贝 ================== */
+/* ================== 绋冲畾甯ф嫹璐?================== */
 
 static void camera_copy_stable_frame(void)
 {
-    /* 在 DMA 中断间隙将摄像头图像拷贝到 raw_snapshot，保证处理时不会撕裂 */
+    /* 鍦?DMA 涓柇闂撮殭灏嗘憚鍍忓ご鍥惧儚鎷疯礉鍒?raw_snapshot锛屼繚璇佸鐞嗘椂涓嶄細鎾曡 */
     memcpy(raw_snapshot[0], mt9v03x_image_1[0], MT9V03X_1_W * MT9V03X_1_H);
 }
 
-/* =============== Otsu 大津法自适应二值化 =============== */
+/* =============== Otsu 澶ф触娉曡嚜閫傚簲浜屽€煎寲 =============== */
 
-/* =============== 框检测直角弯（task1 使用） =============== */
+/* =============== 妗嗘娴嬬洿瑙掑集锛坱ask1 浣跨敤锛?=============== */
 static void detect_box_sharp_turn(void)
 {
     uint16 x0, y0, x1, y1;
@@ -251,213 +248,24 @@ static void detect_box_sharp_turn(void)
     turn_dbg_is_left = is_left_turn;
 }
 
-/* =============== 中心框边缘检测转弯 + T字/十字路口 =============== */
-/*
- * 原理：
- *   扫描中心框四条边，根据白线出现的边组合分类：
- *     下+左         → 左直角弯   (type 3)
- *     下+右         → 右直角弯   (type 3)
- *     下+左+上       → 左T字路口  (type 1, 触发左转)
- *     下+右+上       → 右T字路口  (type 1, 触发右转)
- *     下+左+右       → 正T字路口  (type 1, 方向不确定不走线)
- *     下+左+右+上    → 十字路口   (type 2, 直行)
- *   只判断有无，不关心数量。
- */
-static void detect_box_edge_turn(int left_edge[], int right_edge[])
-{
-    uint16 x0, y0, x1, y1;
-    uint8 top_hit = 0, left_hit = 0, right_hit = 0;
-    uint16 side_scan_start;
-    int left_hit_y = -1;
-    int right_hit_y = -1;
-
-    get_turn_detect_box(&x0, &y0, &x1, &y1);
-    side_scan_start = y0 + 1;
-    if (side_scan_start <= MT9V03X_1_H / 2)
-        side_scan_start = MT9V03X_1_H / 2 + 1;
-
-    for (uint16 y = y0; y < y0 + 15 && y < MT9V03X_1_H && !top_hit; y++)
-    {
-        uint16 mid = (x0 + x1) / 2;
-        for (int span = 0; span <= (int)(x1 - mid) && !top_hit; span++)
-        {
-            int check_cols[2] = { (int)mid - span, (int)mid + span };
-            for (int ci = 0; ci < 2 && !top_hit; ci++)
-            {
-                int x = check_cols[ci];
-                if (span == 0 && ci == 1) break;
-                if (x < (int)x0 || x > (int)x1) continue;
-                if (process_image[y][x] == 0) continue;
-
-                int chk_left = (int)x - 5;  if (chk_left < 0) chk_left = 0;
-                int chk_right = (int)x + 5;  if (chk_right >= MT9V03X_1_W) chk_right = MT9V03X_1_W - 1;
-                int pass_cols = 0;
-                for (int col = chk_left; col <= chk_right; col++)
-                {
-                    int run = 0;
-                    for (int r = (int)y; r >= 0; r--)
-                    {
-                        if (process_image[r][col] != 0) run++; else break;
-                    }
-                    if (run >= 40) pass_cols++;
-                }
-                if (pass_cols >= 2) top_hit = 1;
-            }
-        }
-    }
-    for (uint16 y = side_scan_start; y < y1 && !left_hit; y++)
-    {
-        if (process_image[y][x0] != 0)
-        {
-            int chk_top = (int)y - 5;  if (chk_top < 0) chk_top = 0;
-            int chk_bot = (int)y + 5;  if (chk_bot >= MT9V03X_1_H) chk_bot = MT9V03X_1_H - 1;
-            int pass_rows = 0;
-            for (int row = chk_top; row <= chk_bot; row++)
-            {
-                int run = 0;
-                for (int col = (int)x0; col < MT9V03X_1_W; col++)
-                {
-                    if (process_image[row][col] != 0) run++; else break;
-                }
-                if (run >= 50) pass_rows++;
-            }
-            if (pass_rows >= 2) { left_hit = 1; left_hit_y = y; }
-        }
-    }
-    for (uint16 y = side_scan_start; y < y1 && !right_hit; y++)
-    {
-        if (process_image[y][x1] != 0)
-        {
-            int chk_top = (int)y - 5;  if (chk_top < 0) chk_top = 0;
-            int chk_bot = (int)y + 5;  if (chk_bot >= MT9V03X_1_H) chk_bot = MT9V03X_1_H - 1;
-            int pass_rows = 0;
-            for (int row = chk_top; row <= chk_bot; row++)
-            {
-                int run = 0;
-                for (int col = (int)x1; col >= 0; col--)
-                {
-                    if (process_image[row][col] != 0) run++; else break;
-                }
-                if (run >= 50) pass_rows++;
-            }
-            if (pass_rows >= 2) { right_hit = 1; right_hit_y = y; }
-        }
-    }
-
-    /* 分类：直角、T字、十字按边组合严格区分 */
-    int is_cross = left_hit && right_hit && top_hit;
-    int is_t_left = left_hit && top_hit && !right_hit;
-    int is_t_right = right_hit && top_hit && !left_hit;
-    int is_t_both = left_hit && right_hit && !top_hit;
-    int is_t_junc = is_t_left || is_t_right || is_t_both || is_cross;
-    int is_left  = left_hit  && !right_hit && !top_hit;
-    int is_right = right_hit && !left_hit  && !top_hit;
-
-    t_junction_seen = is_t_junc ? 1 : 0;
-
-    if (is_t_junc)
-    {
-        uint8 t_dir = Task2_GetNextTDir();
-        junction_type_from_camera = 1;
-        junction_side = 0;
-        is_left  = 0;
-        is_right = 0;
-
-        if (t_dir == 0)      { junction_side = 2; is_right = 1; }
-        else if (t_dir == 1) { junction_side = 1; is_left  = 1; }
-    }
-    else if (is_left || is_right)
-    {
-        junction_type_from_camera = 3;
-        junction_side = is_left ? 1 : 2;
-        t_junction_seen = 0;
-    }
-    else
-    {
-        junction_type_from_camera = 0;
-        junction_side = 0;
-        t_junction_seen = 0;
-        turn_dbg_active = 0;
-        return;
-    }
-
-    if (!is_left && !is_right)
-    {
-        turn_dbg_active = 0;
-        return;
-    }
-
-    int start_x = (int)process_line_mid[MT9V03X_1_H - 1];
-    int start_y = MT9V03X_1_H - 1;
-    int corner_y = is_left ? left_hit_y : right_hit_y;
-    int end_x = is_left ? SHARP_TURN_EDGE_MARGIN
-                         : MT9V03X_1_W - 1 - SHARP_TURN_EDGE_MARGIN;
-    int end_y;
-
-    if (start_x < 0 || start_x >= MT9V03X_1_W) start_x = MT9V03X_1_W / 2;
-    if (corner_y < 0)
-    {
-        junction_type_from_camera = 0;
-        junction_side = 0;
-        t_junction_seen = 0;
-        turn_dbg_active = 0;
-        return;
-    }
-
-    end_y = corner_y;
-    if (end_y < 0) end_y = 0;
-    if (end_y > start_y) end_y = start_y;
-
-    int dx = end_x - start_x;
-    int dy = end_y - start_y;
-    int steps = (abs(dy) > abs(dx)) ? abs(dy) : abs(dx);
-    if (steps < 1) steps = 1;
-
-    float x_inc = (float)dx / (float)steps;
-    float y_inc = (float)dy / (float)steps;
-    float x = (float)start_x;
-    float y = (float)start_y;
-
-    for (int s = 0; s <= steps; s++)
-    {
-        int row = (int)(y + 0.5f);
-        int col = (int)(x + 0.5f);
-        if (row >= 0 && row < MT9V03X_1_H && col >= 0 && col < MT9V03X_1_W)
-            process_line_mid[row] = (int16)col;
-        x += x_inc;
-        y += y_inc;
-    }
-    for (int row = 0; row < end_y; row++)
-        process_line_mid[row] = (int16)end_x;
-
-    turn_dbg_active  = 1;
-    turn_dbg_start_x = start_x;
-    turn_dbg_start_y = start_y;
-    turn_dbg_end_x   = end_x;
-    turn_dbg_end_y   = end_y;
-    turn_dbg_corner_x = is_left ? (int)x0 : (int)x1;
-    turn_dbg_corner_y = corner_y;
-    turn_dbg_is_left = is_left;
-}
-
 static uint8 compute_otsu_threshold(void)
 {
     /*
-     * 大津法自动选取最优二值化阈值：
-     *   遍历 0-255 所有灰度级，计算类间方差（between-class variance），
-     *   取方差最大的灰度级作为阈值。
-     *   优点是自适应光照变化，比固定阈值更鲁棒。
+     * 澶ф触娉曡嚜鍔ㄩ€夊彇鏈€浼樹簩鍊煎寲闃堝€硷細
+     *   閬嶅巻 0-255 鎵€鏈夌伆搴︾骇锛岃绠楃被闂存柟宸紙between-class variance锛夛紝
+     *   鍙栨柟宸渶澶х殑鐏板害绾т綔涓洪槇鍊笺€?
+     *   浼樼偣鏄嚜閫傚簲鍏夌収鍙樺寲锛屾瘮鍥哄畾闃堝€兼洿椴佹銆?
      */
     int histogram[256] = {0};
     int pixel_count = MT9V03X_1_H * MT9V03X_1_W;
     uint8 *img_ptr = &raw_snapshot[0][0];
 
-    /* 统计灰度直方图 */
+    /* 缁熻鐏板害鐩存柟鍥?*/
     for(int i = 0; i < pixel_count; i++) {
         histogram[img_ptr[i]]++;
     }
 
-    /* 计算全局灰度总和，用于后续计算类间方差 */
+    /* 璁＄畻鍏ㄥ眬鐏板害鎬诲拰锛岀敤浜庡悗缁绠楃被闂存柟宸?*/
     int sum = 0;
     for(int i = 0; i < 256; i++) {
         sum += i * histogram[i];
@@ -467,18 +275,18 @@ static uint8 compute_otsu_threshold(void)
     float varMax = 0.0;
     uint8 threshold = 0;
 
-    /* 遍历所有灰度级，找使类间方差最大的阈值 */
+    /* 閬嶅巻鎵€鏈夌伆搴︾骇锛屾壘浣跨被闂存柟宸渶澶х殑闃堝€?*/
     for(int i = 0; i < 256; i++) {
-        wB += histogram[i];            /* 前景像素数 */
+        wB += histogram[i];            /* 鍓嶆櫙鍍忕礌鏁?*/
         if (wB == 0) continue;
 
-        wF = pixel_count - wB;         /* 背景像素数 */
+        wF = pixel_count - wB;         /* 鑳屾櫙鍍忕礌鏁?*/
         if (wF == 0) break;
 
-        sumB += i * histogram[i];      /* 前景灰度累加 */
-        int sumF = sum - sumB;         /* 背景灰度累加 */
+        sumB += i * histogram[i];      /* 鍓嶆櫙鐏板害绱姞 */
+        int sumF = sum - sumB;         /* 鑳屾櫙鐏板害绱姞 */
 
-        /* 类间方差公式：Var = wB * wF * (uB - uF)^2 */
+        /* 绫婚棿鏂瑰樊鍏紡锛歏ar = wB * wF * (uB - uF)^2 */
         float varBetween = (float)sumB * sumB / wB + (float)sumF * sumF / wF;
 
         if (varBetween > varMax) {
@@ -487,11 +295,11 @@ static uint8 compute_otsu_threshold(void)
         }
     }
 
-    /* 对大津法结果做限幅，避免极端值 */
+    /* 瀵瑰ぇ娲ユ硶缁撴灉鍋氶檺骞咃紝閬垮厤鏋佺鍊?*/
     if(threshold < THRESHOLD_CLAMP_LO) threshold = THRESHOLD_CLAMP_LO;
     if(threshold > THRESHOLD_CLAMP_HI) threshold = THRESHOLD_CLAMP_HI;
 
-    /* 增加曝光自适应偏移（暗场调高阈值压噪，亮场调低保留细节 */
+    /* 澧炲姞鏇濆厜鑷€傚簲鍋忕Щ锛堟殫鍦鸿皟楂橀槇鍊煎帇鍣紝浜満璋冧綆淇濈暀缁嗚妭 */
     {
         int range = THRESHOLD_CLAMP_HI - THRESHOLD_CLAMP_LO;
         int offset = THRESHOLD_DARK_MIN
@@ -504,19 +312,19 @@ static uint8 compute_otsu_threshold(void)
     return threshold;
 }
 
-/* =============== 主处理任务 =============== */
+/* =============== 涓诲鐞嗕换鍔?=============== */
 
 void image_process_task(void)
 {
-    /* 检查摄像头一帧是否采集完毕 */
+    /* 妫€鏌ユ憚鍍忓ご涓€甯ф槸鍚﹂噰闆嗗畬姣?*/
     if (mt9v03x_finish_flag_1 == 1)
     {
         mt9v03x_finish_flag_1 = 0;
 
-        /* 步骤 1：稳定拷贝一帧到 raw_snapshot */
+        /* 姝ラ 1锛氱ǔ瀹氭嫹璐濅竴甯у埌 raw_snapshot */
         camera_copy_stable_frame();
 
-        /* 步骤 2：Otsu 自适应二值化 */
+        /* 姝ラ 2锛歄tsu 鑷€傚簲浜屽€煎寲 */
         uint8 dynamic_threshold = compute_otsu_threshold();
         uint8 *src = &raw_snapshot[0][0];
         uint8 *dst = &process_image[0][0];
@@ -530,9 +338,9 @@ void image_process_task(void)
         #endif
         }
 
-        // 3x3 去噪：孤立白点（邻域白点数 < 2）视为噪声抹掉
+        // 3x3 鍘诲櫔锛氬绔嬬櫧鐐癸紙閭诲煙鐧界偣鏁?< 2锛夎涓哄櫔澹版姽鎺?
         {
-            static uint8 clean[MT9V03X_1_H][MT9V03X_1_W];  /* 放静态区，避免栈溢出 */
+            static uint8 clean[MT9V03X_1_H][MT9V03X_1_W];  /* 鏀鹃潤鎬佸尯锛岄伩鍏嶆爤婧㈠嚭 */
             for (int y = 1; y < MT9V03X_1_H - 1; y++)
             {
                 for (int x = 1; x < MT9V03X_1_W - 1; x++)
@@ -550,7 +358,7 @@ void image_process_task(void)
                     clean[y][x] = (nb >= 2) ? 255 : 0;
                 }
             }
-            // 边界行/列保持不变
+            // 杈圭晫琛?鍒椾繚鎸佷笉鍙?
             for (int x = 0; x < MT9V03X_1_W; x++)
             {
                 clean[0][x] = process_image[0][x];
@@ -564,14 +372,14 @@ void image_process_task(void)
             memcpy(&process_image[0][0], &clean[0][0], MT9V03X_1_H * MT9V03X_1_W);
         }
 
-        int lost_line_count = 0;  /* 本轮连续丢线的行数统计 */
-        int boundary_left[MT9V03X_1_H];   /* 每行赛道左边界，供直角弯检测复用 */
-        int boundary_right[MT9V03X_1_H];  /* 每行赛道右边界，供直角弯检测复用 */
+        int lost_line_count = 0;  /* 鏈疆杩炵画涓㈢嚎鐨勮鏁扮粺璁?*/
+        int boundary_left[MT9V03X_1_H];   /* 姣忚璧涢亾宸﹁竟鐣岋紝渚涚洿瑙掑集妫€娴嬪鐢?*/
+        int boundary_right[MT9V03X_1_H];  /* 姣忚璧涢亾鍙宠竟鐣岋紝渚涚洿瑙掑集妫€娴嬪鐢?*/
 
-        /* 步骤 3：逐行扫描中线（从近处往远处扫 */
+        /* 姝ラ 3锛氶€愯鎵弿涓嚎锛堜粠杩戝寰€杩滃鎵?*/
         for (int i = MT9V03X_1_H - 1; i >= 0; i--)
         {
-            /* 从上一行中线位置出发搜索，提高速度并抑制噪声 */
+            /* 浠庝笂涓€琛屼腑绾夸綅缃嚭鍙戞悳绱紝鎻愰珮閫熷害骞舵姂鍒跺櫔澹?*/
             int center_seed = (i == MT9V03X_1_H - 1) ? (MT9V03X_1_W / 2) : process_line_mid[i + 1];
             if (center_seed < 0) center_seed = 0;
             if (center_seed >= MT9V03X_1_W) center_seed = MT9V03X_1_W - 1;
@@ -580,7 +388,7 @@ void image_process_task(void)
             int left;
             int right;
 
-            /* 从种子点向两侧扩散搜索白色像素 */
+            /* 浠庣瀛愮偣鍚戜袱渚ф墿鏁ｆ悳绱㈢櫧鑹插儚绱?*/
             for (int span = 0; span < MT9V03X_1_W / 2; span++)
             {
                 left  = center_seed - span;
@@ -598,7 +406,7 @@ void image_process_task(void)
                 }
             }
 
-            /* 该行完全找不到赛道 — 丢线，用种子点填充 */
+            /* 璇ヨ瀹屽叏鎵句笉鍒拌禌閬?鈥?涓㈢嚎锛岀敤绉嶅瓙鐐瑰～鍏?*/
             if (line_pos < 0)
             {
                 boundary_left[i]  = -1;
@@ -608,7 +416,7 @@ void image_process_task(void)
                 continue;
             }
 
-            /* 找到赛道后，向左右扩展找到完整边界 */
+            /* 鎵惧埌璧涢亾鍚庯紝鍚戝乏鍙虫墿灞曟壘鍒板畬鏁磋竟鐣?*/
             left = line_pos;
             right = line_pos;
             while ((left > 0) && (process_image[i][left] != 0)) left--;
@@ -617,7 +425,7 @@ void image_process_task(void)
             boundary_left[i]  = left;
             boundary_right[i] = right;
 
-            /* 如果赛道宽度小于 3 像素，视为噪声，用种子点代替 */
+            /* 濡傛灉璧涢亾瀹藉害灏忎簬 3 鍍忕礌锛岃涓哄櫔澹帮紝鐢ㄧ瀛愮偣浠ｆ浛 */
             if (right - left < 3)
             {
                 process_line_mid[i] = center_seed;
@@ -629,7 +437,7 @@ void image_process_task(void)
             }
         }
 
-        // 黑区补线：取丢失段前后各5行的有效中线，直线连接
+        // 榛戝尯琛ョ嚎锛氬彇涓㈠け娈靛墠鍚庡悇5琛岀殑鏈夋晥涓嚎锛岀洿绾胯繛鎺?
         {
             uint8 lost_flag[MT9V03X_1_H];
             for (int i = 0; i < MT9V03X_1_H; i++)
@@ -655,16 +463,13 @@ void image_process_task(void)
             }
         }
 
-        /* 步骤 4：检测转弯（task1用框检测直角弯，task2用中心框边缘+T字路口） */
-        if (control_task_mode == 1)
-            detect_box_sharp_turn();
-        else
-            detect_box_edge_turn(boundary_left, boundary_right);
+        /* 姝ラ 4锛氭娴嬭浆寮紙task1鐢ㄦ妫€娴嬬洿瑙掑集锛宼ask2鐢ㄤ腑蹇冩杈圭紭+T瀛楄矾鍙ｏ級 */
+        detect_box_sharp_turn();
 
         line_lost_count = (lost_line_count > 255) ? 255 : (uint8)lost_line_count;
 
-        /* 步骤 5：加权平均计算赛道偏移量（近处行权重大）
-         *   只取画面中间段（1/3 到 5/6），忽略顶部太远的行和底部太近的行 */
+        /* 姝ラ 5锛氬姞鏉冨钩鍧囪绠楄禌閬撳亸绉婚噺锛堣繎澶勮鏉冮噸澶э級
+         *   鍙彇鐢婚潰涓棿娈碉紙1/3 鍒?5/6锛夛紝蹇界暐椤堕儴澶繙鐨勮鍜屽簳閮ㄥお杩戠殑琛?*/
         {
             int32 sum = 0;
             int32 weight_sum = 0;
@@ -673,26 +478,26 @@ void image_process_task(void)
 
             for (int i = start; i < end; i++)
             {
-                int weight = i;  /* 越靠近底部的行权重越大 */
+                int weight = i;  /* 瓒婇潬杩戝簳閮ㄧ殑琛屾潈閲嶈秺澶?*/
                 sum += (process_line_mid[i] - (MT9V03X_1_W / 2)) * weight;
                 weight_sum += weight;
             }
             track_offset = (weight_sum > 0) ? (int16)(sum / weight_sum) : 0;
         }
 
-        /* 步骤 6：将结果同步到对外数组给 motor.c 使用 */
+        /* 姝ラ 6锛氬皢缁撴灉鍚屾鍒板澶栨暟缁勭粰 motor.c 浣跨敤 */
         for (int i = 0; i < MT9V03X_1_H; i++)
         {
             line_mid[i] = process_line_mid[i];
         }
 
-        /* 步骤 7：交换处理/显示缓冲区 */
+        /* 姝ラ 7锛氫氦鎹㈠鐞?鏄剧ず缂撳啿鍖?*/
         image_swap_buffer();
         image_ready = 1;
     }
 }
 
-/* =============== 显示任务 =============== */
+/* =============== 鏄剧ず浠诲姟 =============== */
 
 void image_display_task(void)
 {
@@ -700,14 +505,14 @@ void image_display_task(void)
     static uint8 refresh_cnt = 0;
     if (!image_ready) return;
 
-    /* 降低显示刷新率（每 3 帧显示一次），为图像处理腾出 CPU */
+    /* 闄嶄綆鏄剧ず鍒锋柊鐜囷紙姣?3 甯ф樉绀轰竴娆★級锛屼负鍥惧儚澶勭悊鑵惧嚭 CPU */
     if (++refresh_cnt < 3) return;
     refresh_cnt = 0;
 
-    /* 显示二值化后的摄像头图像 */
+    /* 鏄剧ず浜屽€煎寲鍚庣殑鎽勫儚澶村浘鍍?*/
     ips200_show_gray_image(0, 0, display_image[0], MT9V03X_1_W, MT9V03X_1_H, MT9V03X_1_W, MT9V03X_1_H, 0);
 
-    /* 绿色检测框 */
+    /* 缁胯壊妫€娴嬫 */
     {
         uint16 x0, y0, x1, y1;
         get_turn_detect_box(&x0, &y0, &x1, &y1);
@@ -758,7 +563,7 @@ void image_display_task(void)
         }
     }
 
-    /* 用红点画中线、蓝点画左边界、绿点画右边界 */
+    /* 鐢ㄧ孩鐐圭敾涓嚎銆佽摑鐐圭敾宸﹁竟鐣屻€佺豢鐐圭敾鍙宠竟鐣?*/
     for (int i = 0; i < MT9V03X_1_H; i++)
     {
         if ((display_line_mid[i] >= 0) && (display_line_mid[i] < MT9V03X_1_W))
@@ -779,7 +584,7 @@ void image_display_task(void)
         if (r >= 0 && r > l) ips200_draw_point((uint16)r, (uint16)i, RGB565_YELLOW);
     }
 
-    /* IMU 陀螺仪数据显示在摄像头图像下方 */
+    /* IMU 闄€铻轰华鏁版嵁鏄剧ず鍦ㄦ憚鍍忓ご鍥惧儚涓嬫柟 */
     ips200_set_font(IPS200_6X8_FONT);
     ips200_set_color(RGB565_RED, RGB565_WHITE);
     ips200_show_string(0, 122, "GZ");
@@ -789,7 +594,7 @@ void image_display_task(void)
     ips200_show_string(108, 122, "GX");
     ips200_show_int(126, 122, (int32)(gyro[0] * 57.3f), 4);
 
-    /* 路口类型 */
+    /* 璺彛绫诲瀷 */
     ips200_show_string(0, 130, "J:");
     if (junction_type_from_camera == 2)
         ips200_show_string(18, 130, "CRS");
@@ -801,38 +606,29 @@ void image_display_task(void)
         ips200_show_string(18, 130, "---");
 
     ips200_show_string(0, 140, "T:");
-    if (control_task_mode == 1)
-    {
-        ips200_show_int(18, 140, Task1_GetCount(), 2);
-        ips200_show_string(36, 140, "/");
-        ips200_show_int(42, 140, TASK1_TURN_TARGET, 2);
-    }
-    else
-    {
-        ips200_show_int(18, 140, Task2_GetCount(), 2);
-        ips200_show_string(36, 140, "/");
-        ips200_show_int(42, 140, TASK2_TURN_TARGET, 2);
-    }
+    ips200_show_int(18, 140, Task1_GetCount(), 2);
+    ips200_show_string(36, 140, "/");
+    ips200_show_int(42, 140, TASK1_TURN_TARGET, 2);
 
 #if ENABLE_TURN_DEBUG
-    /* 直角弯诊断叠加层 */
+    /* 鐩磋寮瘖鏂彔鍔犲眰 */
     if (turn_dbg_active)
     {
-        /* 青色斜线表示生成的转弯中线 */
+        /* 闈掕壊鏂滅嚎琛ㄧず鐢熸垚鐨勮浆寮腑绾?*/
         ips200_draw_line((uint16)turn_dbg_start_x, (uint16)turn_dbg_start_y,
                          (uint16)turn_dbg_end_x,   (uint16)turn_dbg_end_y,
                          RGB565_CYAN);
 
-        /* 绿色点标记起点（底部中心） */
+        /* 缁胯壊鐐规爣璁拌捣鐐癸紙搴曢儴涓績锛?*/
         ips200_draw_point((uint16)turn_dbg_start_x, (uint16)turn_dbg_start_y, RGB565_GREEN);
 
-        /* 黄色点标记终点（弯角瞄准点） */
+        /* 榛勮壊鐐规爣璁扮粓鐐癸紙寮鐬勫噯鐐癸級 */
         ips200_draw_point((uint16)turn_dbg_end_x, (uint16)turn_dbg_end_y, RGB565_YELLOW);
 
-        /* 紫色小框标记识别到的框边拐点 */
+        /* 绱壊灏忔鏍囪璇嗗埆鍒扮殑妗嗚竟鎷愮偣 */
         draw_clamped_box(turn_dbg_corner_x, turn_dbg_corner_y, 3, RGB565_MAGENTA);
 
-        /* 右上角显示转弯方向 */
+        /* 鍙充笂瑙掓樉绀鸿浆寮柟鍚?*/
         if (turn_dbg_is_left)
         {
             ips200_show_string(MT9V03X_1_W - 30, 0, "LT"); /* Left Turn */
@@ -847,7 +643,7 @@ void image_display_task(void)
 #endif
 }
 
-/* ====================== 对外接口 ====================== */
+/* ====================== 瀵瑰鎺ュ彛 ====================== */
 
 int16 Camera_GetTrackOffset(void)
 {
