@@ -57,6 +57,8 @@ uint8 Camera_GetLineLostCount(void);
 
 int16 Camera_GetCenterLine(uint8 row);
 
+uint8 Camera_GetWhiteStop(void);
+
 
 
 #endif

@@ -15,10 +15,13 @@
 #include "imu.h"
 #include "task1.h"
 #include "task2.h"
+#include "task3.h"
 #include "zf_device_ips200.h"
 #include "zf_device_mt9v03x_double.h"
 #include "zf_driver_dma.h"
 #include <string.h>
+
+#define WHITE_STOP_PERCENT 80
 
 /* ======================== 缂栬瘧寮€鍏?======================== */
 
@@ -44,6 +47,7 @@ uint8 junction_visual_type = 0;     /* 0=--- 1=LT 2=RT 3=ST 4=L90 5=R90 */
 uint8 junction_dbg_left_hit = 0;
 uint8 junction_dbg_top_hit = 0;
 uint8 junction_dbg_right_hit = 0;
+static uint8 white_stop = 0;
 static uint8 line_lost_count = 0;    /* 杩炵画涓㈢嚎琛屾暟缁熻 */
 
 /* =================== 鍙岀紦鍐茬紦鍐插尯瀹氫箟 =================== */
@@ -254,6 +258,20 @@ static void detect_box_sharp_turn(void)
     turn_dbg_is_left = is_left_turn;
 }
 
+static void force_straight_t_center_line(uint16 x0, uint16 y0, uint16 x1, uint16 y1, uint8 top_hit)
+{
+    int16 center = MT9V03X_1_W / 2;
+
+    if (top_hit)
+        process_line_mid[y0] = center;
+
+    for (uint16 y = y0 + 10; y < y1; y++)
+    {
+        if ((process_image[y][x0] != 0) || (process_image[y][x1] != 0))
+            process_line_mid[y] = center;
+    }
+}
+
 /* =============== 左右边界顶部10像素检测转弯 + T字路口（task2 使用） =============== */
 static void detect_box_edge_turn(void)
 {
@@ -311,14 +329,24 @@ static void detect_box_edge_turn(void)
     int is_t_junc  = is_t_left || is_t_right || is_t_std;
     int is_left_turn  = left_hit  && !right_hit;
     int is_right_turn = right_hit && !left_hit;
+    uint8 t_dir = (control_task_mode == 3) ? Task3_GetNextTDir() : Task2_GetNextTDir();
 
     junction_dbg_left_hit = left_hit;
     junction_dbg_top_hit = top_hit;
     junction_dbg_right_hit = right_hit;
 
+    if ((t_dir == 2) && (top_hit || left_hit || right_hit))
+    {
+        junction_type_from_camera = 1;
+        junction_side = 0;
+        junction_visual_type = 3;
+        force_straight_t_center_line(x0, y0, x1, y1, top_hit);
+        turn_dbg_active = 0;
+        return;
+    }
+
     if (is_t_junc)
     {
-        uint8 t_dir = Task2_GetNextTDir();
         junction_type_from_camera = 1;
         junction_side = 0;
 
@@ -328,7 +356,7 @@ static void detect_box_edge_turn(void)
 
         if (t_dir == 0)      { junction_side = 2; is_right_turn = 1; }
         else if (t_dir == 1) { junction_side = 1; is_left_turn  = 1; }
-        /* t_dir == 2: junction_side stays 0 */
+        else                 { force_straight_t_center_line(x0, y0, x1, y1, top_hit); }
     }
     else if (is_left_turn || is_right_turn)
     {
@@ -497,6 +525,7 @@ void image_process_task(void)
         // 3x3 鍘诲櫔锛氬绔嬬櫧鐐癸紙閭诲煙鐧界偣鏁?< 2锛夎涓哄櫔澹版姽鎺?
         {
             static uint8 clean[MT9V03X_1_H][MT9V03X_1_W];  /* 鏀鹃潤鎬佸尯锛岄伩鍏嶆爤婧㈠嚭 */
+            int32 white_count = 0;
             for (int y = 1; y < MT9V03X_1_H - 1; y++)
             {
                 for (int x = 1; x < MT9V03X_1_W - 1; x++)
@@ -526,6 +555,16 @@ void image_process_task(void)
                 clean[y][MT9V03X_1_W-1] = process_image[y][MT9V03X_1_W-1];
             }
             memcpy(&process_image[0][0], &clean[0][0], MT9V03X_1_H * MT9V03X_1_W);
+
+            for (int y = 0; y < MT9V03X_1_H; y++)
+            {
+                for (int x = 0; x < MT9V03X_1_W; x++)
+                {
+                    if (process_image[y][x] != 0)
+                        white_count++;
+                }
+            }
+            white_stop = ((white_count * 100) > (MT9V03X_1_H * MT9V03X_1_W * WHITE_STOP_PERCENT)) ? 1 : 0;
         }
 
         int lost_line_count = 0;  /* 鏈疆杩炵画涓㈢嚎鐨勮鏁扮粺璁?*/
@@ -750,6 +789,28 @@ void image_display_task(void)
         ips200_show_string(36, 140, "/");
         ips200_show_int(42, 140, TASK1_TURN_TARGET, 2);
     }
+    else if (control_task_mode == 3)
+    {
+        ips200_show_int(18, 140, Task3_GetCount(), 2);
+        ips200_show_string(36, 140, "/");
+        ips200_show_int(42, 140, TASK3_TURN_TARGET, 2);
+        ips200_show_string(60, 140, "SI:");
+        ips200_show_int(84, 140, Task3_GetSeqIndex(), 2);
+        ips200_show_string(102, 140, "SD:");
+        if (junction_side == 1)
+            ips200_show_string(126, 140, "L");
+        else if (junction_side == 2)
+            ips200_show_string(126, 140, "R");
+        else
+            ips200_show_string(126, 140, "S");
+
+        ips200_show_string(0, 148, "L");
+        ips200_show_int(12, 148, junction_dbg_left_hit, 1);
+        ips200_show_string(30, 148, "T");
+        ips200_show_int(42, 148, junction_dbg_top_hit, 1);
+        ips200_show_string(60, 148, "R");
+        ips200_show_int(72, 148, junction_dbg_right_hit, 1);
+    }
     else
     {
         ips200_show_int(18, 140, Task2_GetCount(), 2);
@@ -825,4 +886,9 @@ int16 Camera_GetCenterLine(uint8 row)
         return MT9V03X_1_W / 2;
     }
     return line_mid[row];
+}
+
+uint8 Camera_GetWhiteStop(void)
+{
+    return white_stop;
 }

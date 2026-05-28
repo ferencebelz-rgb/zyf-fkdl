@@ -7,8 +7,8 @@ static uint16 stop_delay = 0;
 static uint8  t_seq_index = 0;
 static uint8  beep_timer = 0;
 
-/* T字路口固定序列: 右(0), 左(1), 左(1), 右(0), 直行(2), 直行(2) */
-static const uint8 t_seq[TASK2_T_SEQ_LEN] = {0, 0, 1, 1, 0, 2, 2};
+/* T字路口固定序列: 右(0), 右(0), 左(1), 左(1), 右(0), 右(0), 右(0), 直行(2), 直行(2), 右(0) */
+static const uint8 t_seq[TASK2_T_SEQ_LEN] = {0, 0, 1, 1, 0, 0, 0, 2, 2, 0};
 
 void Task2_Init(void)
 {

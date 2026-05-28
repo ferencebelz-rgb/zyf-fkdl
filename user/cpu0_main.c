@@ -50,6 +50,13 @@ int core0_main(void)
             break;  // 启动任务2（T字路口序列）
         }
 
+        if(key_get_state(KEY_3) == KEY_SHORT_PRESS)
+        {
+            key_clear_state(KEY_3);
+            control_task_mode = 3;
+            break;  // 启动任务3（14次固定路书）
+        }
+
         if(key_get_state(KEY_4) == KEY_SHORT_PRESS)
         {
             key_clear_state(KEY_4);

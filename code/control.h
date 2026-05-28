@@ -13,10 +13,10 @@
 #define CONTROL_TURN_KP_DEFAULT         1.8f
 #define CONTROL_TURN_KD_DEFAULT         0.45f
 #define CONTROL_TURN_LIMIT_DEFAULT      180
-#define CONTROL_SHARP_TURN_GAIN         5.55f
+#define CONTROL_SHARP_TURN_GAIN         5.5f
 #define CONTROL_GYRO_DAMPING_GAIN       6.5f
 
-extern uint8 control_task_mode;  /* 1=task1, 2=task2 */
+extern uint8 control_task_mode;  /* 1=task1, 2=task2, 3=task3 */
 
 void Control_Init(void);
 void Control_Task10ms(void);
