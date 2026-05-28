@@ -13,8 +13,8 @@
 #define CONTROL_TURN_KP_DEFAULT         1.8f
 #define CONTROL_TURN_KD_DEFAULT         0.45f
 #define CONTROL_TURN_LIMIT_DEFAULT      180
-#define CONTROL_SHARP_TURN_GAIN         5.21f
-#define CONTROL_GYRO_DAMPING_GAIN       8.0f
+#define CONTROL_SHARP_TURN_GAIN         5.55f
+#define CONTROL_GYRO_DAMPING_GAIN       6.5f
 
 extern uint8 control_task_mode;  /* 1=task1, 2=task2 */
 
