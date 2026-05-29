@@ -88,3 +88,16 @@ uint8 Task3_IsFinished(void)
 {
     return (stop_delay >= 500) ? 1 : 0;
 }
+
+/* 每个弯的出弯偏航角阈值（度），按序列索引对应 */
+static const float exit_yaw_seq[TASK3_T_SEQ_LEN] = {
+    85.0f, 85.0f, 60.0f, 85.0f, 85.0f,
+    85.0f, 85.0f, 85.0f, 85.0f, 85.0f,
+    85.0f, 85.0f, 85.0f, 85.0f, 85.0f
+};
+
+float Task3_GetExitYaw(void)
+{
+    if (t_seq_index >= TASK3_T_SEQ_LEN) return 85.0f;
+    return exit_yaw_seq[t_seq_index];
+}

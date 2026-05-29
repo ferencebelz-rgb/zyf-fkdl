@@ -110,9 +110,9 @@ static void get_turn_detect_box(uint16 *x0, uint16 *y0, uint16 *x1, uint16 *y1)
     uint16 box_w = MT9V03X_1_W / 2;
     uint16 box_h = MT9V03X_1_H / 2;
 
-    *x0 = (MT9V03X_1_W - box_w) / 2 - 24;
+    *x0 = (MT9V03X_1_W - box_w) / 2 - 34;
     *y0 = (MT9V03X_1_H - box_h) / 2;
-    *x1 = *x0 + box_w + 48;
+    *x1 = *x0 + box_w + 73;
     *y1 = MT9V03X_1_H - 1 - 10;
 }
 
@@ -567,6 +567,62 @@ void image_process_task(void)
             white_stop = ((white_count * 100) > (MT9V03X_1_H * MT9V03X_1_W * WHITE_STOP_PERCENT)) ? 1 : 0;
         }
 
+        /* 垂直方向：白-黑-白交替且黑段≤20像素，填充为白（只处理前后，不处理左右） */
+        for (int x = 0; x < MT9V03X_1_W; x++)
+        {
+            for (int y = 1; y < MT9V03X_1_H - 1; )
+            {
+                if (process_image[y][x] == 0)
+                {
+                    int run_start = y;
+                    while (y < MT9V03X_1_H - 1 && process_image[y][x] == 0)
+                        y++;
+                    int run_len = y - run_start;
+                    if (run_len <= 20
+                        && run_start > 0
+                        && y < MT9V03X_1_H
+                        && process_image[run_start - 1][x] != 0
+                        && process_image[y][x] != 0)
+                    {
+                        for (int k = run_start; k < y; k++)
+                            process_image[k][x] = 255;
+                    }
+                }
+                else
+                {
+                    y++;
+                }
+            }
+        }
+
+        /* 水平方向：逐行白-黑-白交替且黑段≤10像素，填充为白 */
+        for (int y = 0; y < MT9V03X_1_H; y++)
+        {
+            for (int x = 1; x < MT9V03X_1_W - 1; )
+            {
+                if (process_image[y][x] == 0)
+                {
+                    int run_start = x;
+                    while (x < MT9V03X_1_W - 1 && process_image[y][x] == 0)
+                        x++;
+                    int run_len = x - run_start;
+                    if (run_len <= 10
+                        && run_start > 0
+                        && x < MT9V03X_1_W
+                        && process_image[y][run_start - 1] != 0
+                        && process_image[y][x] != 0)
+                    {
+                        for (int k = run_start; k < x; k++)
+                            process_image[y][k] = 255;
+                    }
+                }
+                else
+                {
+                    x++;
+                }
+            }
+        }
+
         int lost_line_count = 0;  /* 鏈疆杩炵画涓㈢嚎鐨勮鏁扮粺璁?*/
         int boundary_left[MT9V03X_1_H];   /* 姣忚璧涢亾宸﹁竟鐣岋紝渚涚洿瑙掑集妫€娴嬪鐢?*/
         int boundary_right[MT9V03X_1_H];  /* 姣忚璧涢亾鍙宠竟鐣岋紝渚涚洿瑙掑集妫€娴嬪鐢?*/
@@ -601,12 +657,11 @@ void image_process_task(void)
                 }
             }
 
-            /* 璇ヨ瀹屽叏鎵句笉鍒拌禌閬?鈥?涓㈢嚎锛岀敤绉嶅瓙鐐瑰～鍏?*/
+            /* 丢线时不处理 */
             if (line_pos < 0)
             {
                 boundary_left[i]  = -1;
                 boundary_right[i] = -1;
-                process_line_mid[i] = center_seed;
                 lost_line_count++;
                 continue;
             }
@@ -643,6 +698,20 @@ void image_process_task(void)
             detect_box_edge_turn();
 
         line_lost_count = (lost_line_count > 255) ? 255 : (uint8)lost_line_count;
+
+        /* 中线平滑：3行滑动平均 */
+        {
+            static int16 smooth[MT9V03X_1_H];
+            for (int i = 0; i < MT9V03X_1_H; i++)
+                smooth[i] = process_line_mid[i];
+            for (int i = 1; i < MT9V03X_1_H - 1; i++)
+            {
+                if (process_line_mid[i - 1] > 0 && process_line_mid[i] > 0 && process_line_mid[i + 1] > 0)
+                    smooth[i] = (process_line_mid[i - 1] + process_line_mid[i] + process_line_mid[i + 1]) / 3;
+            }
+            for (int i = 0; i < MT9V03X_1_H; i++)
+                process_line_mid[i] = smooth[i];
+        }
 
         /* 姝ラ 5锛氬姞鏉冨钩鍧囪绠楄禌閬撳亸绉婚噺锛堣繎澶勮鏉冮噸澶э級
          *   鍙彇鐢婚潰涓棿娈碉紙1/3 鍒?5/6锛夛紝蹇界暐椤堕儴澶繙鐨勮鍜屽簳閮ㄥお杩戠殑琛?*/
@@ -871,6 +940,8 @@ void image_display_task(void)
 
 int16 Camera_GetTrackOffset(void)
 {
+    if (track_offset < 3 && track_offset > -3)
+        return 0;
     return track_offset;
 }
 

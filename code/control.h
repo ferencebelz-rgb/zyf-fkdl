@@ -10,11 +10,11 @@
 #define CONTROL_BASE_SPEED_MAX          900
 #define CONTROL_BASE_RAMP_STEP          4
 
-#define CONTROL_TURN_KP_DEFAULT         1.8f
-#define CONTROL_TURN_KD_DEFAULT         0.45f
+#define CONTROL_TURN_KP_DEFAULT         2.0f
+#define CONTROL_TURN_KD_DEFAULT         0.46f
 #define CONTROL_TURN_LIMIT_DEFAULT      180
 #define CONTROL_SHARP_TURN_GAIN         5.5f
-#define CONTROL_GYRO_DAMPING_GAIN       6.5f
+#define CONTROL_GYRO_DAMPING_GAIN       7.0f
 
 extern uint8 control_task_mode;  /* 1=task1, 2=task2, 3=task3 */
 

@@ -276,22 +276,26 @@ static void update_targets_from_camera(void)
             float dyaw = imu_yaw - turn_entry_yaw;
             if (dyaw < 0) dyaw = -dyaw;
             if (dyaw > 180.0f) dyaw = 360.0f - dyaw;
-            if (dyaw >= 85.0f)
             {
-                turn_active = 0;
-                if (turn_junc_type == 1)
+                float exit_yaw = (control_task_mode == 3)
+                                 ? Task3_GetExitYaw() : 85.0f;
+                if (dyaw >= exit_yaw)
                 {
-                    if (control_task_mode == 3)
-                        Task3_TComplete();
+                    turn_active = 0;
+                    if (turn_junc_type == 1)
+                    {
+                        if (control_task_mode == 3)
+                            Task3_TComplete();
+                        else
+                            Task2_TComplete();
+                    }
                     else
-                        Task2_TComplete();
-                }
-                else
-                {
-                    if (control_task_mode == 3)
-                        Task3_CountTurn();
-                    else
-                        Task2_CountTurn();
+                    {
+                        if (control_task_mode == 3)
+                            Task3_CountTurn();
+                        else
+                            Task2_CountTurn();
+                    }
                 }
             }
         }

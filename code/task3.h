@@ -16,5 +16,6 @@ uint8 Task3_GetNextTDir(void);
 uint8 Task3_GetCount(void);
 uint8 Task3_GetSeqIndex(void);
 uint8 Task3_IsFinished(void);
+float Task3_GetExitYaw(void);
 
 #endif
