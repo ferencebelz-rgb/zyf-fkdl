@@ -360,6 +360,16 @@ static void detect_box_edge_turn(void)
     }
     else if (is_left_turn || is_right_turn)
     {
+        /* 序列方向与视觉方向冲突时，拒绝补线，强制居中直行 */
+        if ((t_dir == 0 && is_left_turn) || (t_dir == 1 && is_right_turn))
+        {
+            junction_type_from_camera = 0;
+            junction_side = 0;
+            junction_visual_type = 0;
+            force_straight_t_center_line(x0, y0, x1, y1, top_hit);
+            turn_dbg_active = 0;
+            return;
+        }
         junction_type_from_camera = 3;
         junction_side = is_left_turn ? 1 : 2;
         junction_visual_type = is_left_turn ? 4 : 5;
