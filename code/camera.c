@@ -32,8 +32,8 @@
 
 /* ====================== 浜屽€煎寲鍙傛暟 ====================== */
 
-#define THRESHOLD_DARK_MIN          0 /* Otsu 缁撴灉鐨勬渶灏忓亸绉昏ˉ鍋?*/
-#define THRESHOLD_DARK_MAX          0 /* 鏈€澶у亸绉昏ˉ鍋匡紙涓?MIN 鐩哥瓑鏃跺浐瀹氬亸绉?*/
+#define THRESHOLD_DARK_MIN         15 /* Otsu 缁撴灉鐨勬渶灏忓亸绉昏ˉ鍋?*/
+#define THRESHOLD_DARK_MAX         15 /* 鏈€澶у亸绉昏ˉ鍋匡紙涓?MIN 鐩哥瓑鏃跺浐瀹氬亸绉?*/
 #define THRESHOLD_CLAMP_LO         30 /* Otsu 缁撴灉涓嬮檺 */
 #define THRESHOLD_CLAMP_HI        220 /* Otsu 缁撴灉涓婇檺 */
 
