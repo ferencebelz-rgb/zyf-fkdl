@@ -8,7 +8,7 @@ static uint8  t_seq_index = 0;
 static uint8  beep_timer = 0;
 
 /* 0=right, 1=left, 2=straight. Stop target counts turns only. */
-static const uint8 t_seq[TASK3_T_SEQ_LEN] = {0, 0, 1, 1, 0, 0, 0, 1, 1, 1, 2, 0, 0, 0, 0};
+static const uint8 t_seq[TASK3_T_SEQ_LEN] = {0, 0, 1, 1, 0, 0, 0, 1, 0, 1, 1, 1, 1, 1, 2, 0, 2, 0};
 
 static void advance_sequence(void)
 {
@@ -91,13 +91,14 @@ uint8 Task3_IsFinished(void)
 
 /* 每个弯的出弯偏航角阈值（度），按序列索引对应 */
 static const float exit_yaw_seq[TASK3_T_SEQ_LEN] = {
-    85.0f, 85.0f, 60.0f, 85.0f, 85.0f,
-    85.0f, 85.0f, 85.0f, 85.0f, 85.0f,
-    85.0f, 85.0f, 85.0f, 85.0f, 85.0f
+    78.0f, 78.0f, 78.0f, 78.0f, 78.0f,
+    78.0f, 78.0f, 78.0f, 78.0f, 78.0f,
+    78.0f, 78.0f, 78.0f, 78.0f, 78.0f,
+    78.0f, 78.0f, 78.0f
 };
 
 float Task3_GetExitYaw(void)
 {
-    if (t_seq_index >= TASK3_T_SEQ_LEN) return 85.0f;
+    if (t_seq_index >= TASK3_T_SEQ_LEN) return 78.0f;
     return exit_yaw_seq[t_seq_index];
 }

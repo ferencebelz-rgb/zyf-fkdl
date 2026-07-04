@@ -3,8 +3,8 @@
 
 #include "zf_common_headfile.h"
 
-#define TASK3_TURN_TARGET   14
-#define TASK3_T_SEQ_LEN     15
+#define TASK3_TURN_TARGET   16
+#define TASK3_T_SEQ_LEN     18
 #define TASK3_BEEP_TICKS    10
 
 void Task3_Init(void);
